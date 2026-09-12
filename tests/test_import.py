@@ -158,6 +158,19 @@ class TestImportBank(unittest.TestCase):
         self.addCleanup(conn.close)
         self.assertEqual(conn.execute('SELECT COUNT(*) FROM questions').fetchone()[0], 1)
 
+    def test_同一库重复导入成功且只留一份(self):
+        # 刻意复用同一个 db 文件：import_bank() 每次都会 executescript(schema.sql)，
+        # schema.sql 若没有 IF NOT EXISTS，第二次导入会抛
+        # OperationalError: table questions already exists——bank.db 就只能生成一次。
+        # 第二次返回的题数必须和第一次一样，且表里恰好只剩这一份：
+        # 说明 runs 的是覆盖（DELETE FROM questions），不是追加。
+        self.write_json([copy.deepcopy(GOOD)])
+        self.assertEqual(import_bank(self.json_path, self.db), 1)
+        self.assertEqual(import_bank(self.json_path, self.db), 1)
+        conn = open_db(self.db)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute('SELECT COUNT(*) FROM questions').fetchone()[0], 1)
+
     def _写一好一坏两题(self):
         # 好题先 INSERT 成功，坏题再撞 questions.stem 的 NOT NULL。
         # stem=None 过得了 validate（validate 不查 stem），挡它的只有 DB 约束。
