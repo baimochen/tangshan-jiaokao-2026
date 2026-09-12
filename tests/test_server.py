@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """API 端点。起真实服务打真实请求——mock 掉 HTTP 就测不出路由和序列化的问题。"""
 import hashlib
+import http.client
 import json
 import os
 import shutil
@@ -635,6 +636,114 @@ class TestMockShort(ApiCase):
         self.assertIn('题库不足: 教育学 需要 23 只有 0', err)
         # 抽题半路失败不该留下一场空卷子：GET 得说没有进行中的那场。
         self.assertIsNone(self.get('/api/mock')['run'])
+
+
+class TestMockStaleBank(ApiCase):
+    """这一场的题号里有一道题从题库里没了（重新导入题库时就会这样：
+    id 换了一批，而 mock_runs 里那几场还留着）。
+
+    两处不能出错，各自对应一条测试：
+
+    · **交卷**：`mock_grade` 是按题号去题库里查的，查不到原来会抛 KeyError，
+      而 Handler 外面没有兜底——客户端**一个字节都收不到**（RemoteDisconnected），
+      模考页永远卡在「模考数据没取到」上。而且旧写法是**先把 submitted 落盘再判分**，
+      所以第一次失败就把这一场钉成「已交卷」，之后每次重试都走短路回同一个错，
+      只能手工改库。现在：查不到回 404，且判不出来就当没交过（重试才有意义）。
+    · **GET /api/mock**：已交卷的那场要在 GET 里现算成绩，同一条查表路径，
+      同样不能把连接掐了。
+    """
+
+    def _drop_question(self, qid):
+        """把一道题从临时副本里摘掉，返回整行与列名（用来原样放回去）。
+
+        只动 self.db（临时副本）——真源 bank.db 一根汗毛都不碰。
+        """
+        conn = sqlite3.connect(self.db)
+        try:
+            cols = [d[1] for d in conn.execute('PRAGMA table_info(questions)')]
+            row = conn.execute('SELECT * FROM questions WHERE id=?', (qid,)).fetchone()
+            self.assertIsNotNone(row, f'{qid} 不在临时库里，测试前提不成立')
+            conn.execute('DELETE FROM questions WHERE id=?', (qid,))
+            conn.commit()
+        finally:
+            conn.close()
+        return cols, row
+
+    def _put_question_back(self, cols, row):
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                f'INSERT INTO questions ({",".join(cols)}) '
+                f'VALUES ({",".join("?" for _ in cols)})', row)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _raw_or_fail(self, method, path, body=None):
+        """打一次请求，把「连接被掐」也接住——那正是这两条测试要防的形态：
+        回 4xx 可以，一个字节都不回不行（说明异常冒出了 Handler）。"""
+        try:
+            return self.raw(path, method, body)
+        except (http.client.RemoteDisconnected, ConnectionResetError) as e:
+            self.fail(f'{method} {path} 的连接被服务端掐了（{type(e).__name__}: {e}）——'
+                      f'异常冒出了 Handler，客户端一个字节都没收到')
+
+    def test_题号里的题不见了交卷要回4xx且留下可重试的那场(self):
+        d = self.post('/api/mock/start', {})
+        ids = d['ids']
+        ans0 = _lookup(self.db, ids[0], 'answer')
+        self.post('/api/mock/answer',
+                  {'qid': ids[0], 'chosen': next(k for k in 'ABCD' if k != ans0)})
+        self.post('/api/mock/answer', {'qid': ids[1], 'chosen': _lookup(self.db, ids[1], 'answer')})
+
+        cols, row = self._drop_question(ids[1])       # 摘掉「答对了的那道」
+        try:
+            code, payload = self._raw_or_fail('POST', '/api/mock/submit', {})
+            self.assertEqual(code, 404, payload)
+            self.assertIn('不在题库里', json.loads(payload)['error'])
+            # 判不出来就不许落盘：那一场还得是「进行中」，GET 也不该带成绩单。
+            # 旧写法把 submitted 先 commit 了，这两条都会红。
+            # 用 raw 而不是 get：真落到「已交卷落盘」那一步时，GET 自己也会 404，
+            # get 会直接抛 HTTPError，把这条断言的说明吞掉。
+            gcode, gpayload = self._raw_or_fail('GET', '/api/mock')
+            self.assertEqual(
+                gcode, 200,
+                f'交卷没交上，那一场却已经不是「进行中」了（GET 回 {gcode}：'
+                f'{gpayload.decode("utf-8", "replace")}）——第一次失败就把 submitted '
+                f'落了盘，之后每次重试都走短路，再也交不上')
+            run = json.loads(gpayload)['run']
+            self.assertIsNotNone(run)
+            self.assertFalse(run['submitted'], '交卷失败了却把 submitted 落了盘')
+            self.assertNotIn('result', run)
+        finally:
+            self._put_question_back(cols, row)
+
+        # 题库修好了，重试**真能交上**：判分与错题本都要对（这才是「可重试」的意思）。
+        r = self.post('/api/mock/submit', {})
+        self.assertEqual(r['total'], 120)
+        self.assertEqual(r['right'], 1)
+        self.assertEqual(r['wrong'], [ids[0]])
+        self.assertIn(ids[0], [x['id'] for x in self.get('/api/wrong')['questions']])
+
+    def test_已交卷那场的题不见了GET要回4xx(self):
+        d = self.post('/api/mock/start', {})
+        qid = d['ids'][0]
+        self.post('/api/mock/answer', {'qid': qid, 'chosen': _lookup(self.db, qid, 'answer')})
+        self.post('/api/mock/submit', {})
+
+        cols, row = self._drop_question(qid)
+        try:
+            code, payload = self._raw_or_fail('GET', '/api/mock')
+            self.assertEqual(code, 404, payload)
+            self.assertIn('不在题库里', json.loads(payload)['error'])
+        finally:
+            self._put_question_back(cols, row)
+
+        # 放回去以后照样能看成绩（GET 里那一步只读，不改库）
+        run = self.get('/api/mock')['run']
+        self.assertTrue(run['submitted'])
+        self.assertEqual(run['result']['total'], 120)
+        self.assertEqual(run['result']['right'], 1)
 
 
 if __name__ == '__main__':

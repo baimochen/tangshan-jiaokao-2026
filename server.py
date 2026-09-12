@@ -49,6 +49,19 @@ class Insufficient(Exception):
     所以别让它冒到顶变成 500。"""
 
 
+class MissingQuestion(Exception):
+    """这一场的题号里有一道题在 questions 里找不到了——对应 404。
+
+    题库重新导入过（id 换了一批、或者那几道被删了）就会这样，而「进行中/已交卷」
+    的那一场还留在 mock_runs 里。mock_grade 是只读的，遇到就抛；两个调用点
+    （交卷、GET 里给已交卷的那场现算成绩）都翻成 404——与 /api/attempts 遇到
+    「题库里没这道题」时的做法一个形状。
+
+    **这个异常绝不能冒到 Handler 外面**：冒出去就是一个字节都不回、连接被掐，
+    客户端拿 RemoteDisconnected，模考页永远卡在「模考数据没取到」上。
+    """
+
+
 def _int_arg(raw, default, lo, hi):
     """把查询串里的整数参数收进 [lo, hi]。
 
@@ -143,13 +156,20 @@ def mock_grade(conn, state, submitted_at=None):
     交卷和「页面重新打开、那场已经交过」两条路都走这里，所以「怎么算分」只有
     一份实现。并进 attempts/错题本是交卷那一步单独做的事（见 do_POST 的 submit）。
     逐题判的是 banklib.grade 那条规则（多选少选算错），不在模考里另写一份。
+
+    题号里的题不在题库里（重新导入过）就抛 MissingQuestion：调用点翻成 404，
+    别让 KeyError 冒到 Handler 外面去。
     """
     answers = state.get('answers') or {}
     bank = {qid: (mod, typ, ans) for qid, mod, typ, ans in
             conn.execute('SELECT id, module, type, answer FROM questions')}
     per, wrong_ids, right = {}, [], 0
     for qid in state['ids']:
-        mod, typ, ans = bank[qid]
+        row = bank.get(qid)
+        if row is None:
+            raise MissingQuestion(
+                f'这场模考里的题 {qid} 已经不在题库里了（题库重新导入过？）')
+        mod, typ, ans = row
         r = per.setdefault(mod, {'n': 0, 'right': 0})
         r['n'] += 1
         chosen = answers.get(qid)
@@ -326,7 +346,14 @@ def make_handler(db_path, web_dir=WEB):
                         if state.get('submitted'):
                             # 已交卷的那场：把成绩一并带上。这里只算不改库——
                             # 重算一遍不能再把错次记一次。
-                            run['result'] = mock_grade(conn, state, state.get('submittedAt'))
+                            # 题号里的题要是没了（题库重新导入过），mock_grade 抛
+                            # MissingQuestion：翻成 404 回一个正经响应，
+                            # 别让异常冒到 Handler 外面把连接掐了。
+                            try:
+                                run['result'] = mock_grade(
+                                    conn, state, state.get('submittedAt'))
+                            except MissingQuestion as e:
+                                return self._send({'error': str(e)}, 404)
                     return self._send({'n': MK_N, 'seconds': MK_SECONDS,
                                        'parts': mock_plan(), 'run': run})
                 finally:
@@ -408,9 +435,21 @@ def make_handler(db_path, web_dir=WEB):
                     # 关着页面过期）都打这个端点，客户端重入一次就会交两回——
                     # 再并一次 attempts 会把错次平白记成 2。
                     if state.get('submitted'):
-                        return self._send(
-                            mock_grade(conn, state, state.get('submittedAt')))
+                        try:
+                            return self._send(
+                                mock_grade(conn, state, state.get('submittedAt')))
+                        except MissingQuestion as e:
+                            return self._send({'error': str(e)}, 404)
                     now = int(time.time() * 1000)
+                    # **先判分、判得出来才落库。** 顺序不能反：题号里的题要是没了，
+                    # mock_grade 会抛 MissingQuestion（上面翻成 404）。要是先把
+                    # submitted 落盘再判分，第一次失败就把这一场钉成「已交卷」，
+                    # 之后每次重试都走上面那条短路，永远回同一个错——只能手工改库。
+                    # 先算后写，失败就当没交过，题库修好了重试就能真交上。
+                    try:
+                        res = mock_grade(conn, state, now)
+                    except MissingQuestion as e:
+                        return self._send({'error': str(e)}, 404)
                     state['submitted'] = True
                     state['submittedAt'] = now
                     # 成绩并入作答记录：答错的自动进错题本。**三条交卷路径只有
@@ -421,7 +460,7 @@ def make_handler(db_path, web_dir=WEB):
                     conn.execute('UPDATE mock_runs SET state=?, submitted_at=? WHERE id=?',
                                  (json.dumps(state, ensure_ascii=False), _iso(now), rid))
                     conn.commit()
-                    return self._send(mock_grade(conn, state, now))
+                    return self._send(res)
                 finally:
                     conn.close()
 

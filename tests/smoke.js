@@ -853,7 +853,6 @@ console.log('\n【模考 · 服务端说了算】');
      && sent[sent.length - 1].body.qid === qid && sent[sent.length - 1].body.chosen === ansQ.answer,
      `请求体带的是这道题与所选项（${qid} → ${ansQ.answer}）`);
   ok(run.answers[qid] === ansQ.answer, `作答记在了这一场里（${qid} → ${ansQ.answer}）`);
-  ok(ansQ.answer === bankById[qid].answer, `（前提）${qid} 答的是正确答案，本地判分绝不会算它错`);
 
   /* 最强的一条：桩回一个和事实相反的响应体——分数 99、答对 119、错题是刚答对的
      那一题。页面若自己算，这些数字一个都对不上。 */
@@ -865,6 +864,13 @@ console.log('\n【模考 · 服务端说了算】');
   fires(byId.mkSubmitBtn, {}); await settle();
   M.fetch.mock.submitOverride = null;
   const inner = byId.mkResult.innerHTML;
+  /* （前提）这一题答的确实是正确答案——**两个来源**：一个是页面提交时写回本机的
+     那份作答，一个是测试这份题库。不能写成 `ansQ.answer === bankById[qid].answer`
+     （ansQ 就是 bankById[qid]，两边同一个对象，永远为真、怎么突变都不会红）。
+     本地判分的页面绝不会把它算成错题，所以下面那条「错题本认响应体」才说明得了问题。 */
+  const pageSaid = JSON.parse(store['jiaokao-answers-2026'] || '{}')[qid];
+  ok(pageSaid === bankById[qid].answer,
+     `（前提）${qid} 上页面记的是正确答案 ${bankById[qid].answer}（本地判分绝不会算它错）`);
   ok(/99<em>\/ 100<\/em>/.test(inner),
      `分数取的是响应体（桩回 99，页面显示 ${(inner.match(/>([\d.]+)<em>\/ 100/) || [])[1]}）`);
   ok(/答对 <b>119<\/b> \/ 120/.test(inner), '答对数也取响应体，不是页面自己数的');
