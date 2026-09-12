@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>刷题 · 唐山教考 2026</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;700&display=swap">
+<!-- 主题必须在 app.css 之前落定，否则暗色用户每页都会先闪一下白底。
+     和 nav.js 里的 KEY 是同一个字符串，改一处就得改两处。 -->
+<script>try{var t=localStorage.getItem('jiaokao-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body data-page="quiz">
+<main class="wrap">
+<header class="masthead">
+<p class="eyebrow">唐山工业职业技术大学 · 2026 选聘 · 教育类</p>
+<h1>刷题</h1>
+</header>
+<section class="view" id="quiz">
+<h2><span class="num">刷题</span>自测题库</h2>
+  <p class="sec-note">共 <b id="qTotal">1000</b> 道，按冲刺表每天的模块排。用法：<b>直接点选项作答</b> —— 答对变绿；答错把你选的那项标红、同时标出正确项，解析自动展开。<b>答错的题会自动进错题本</b>，不用手动勾。</p>
+
+  <div class="qbar">
+    <span class="lbl">已做</span>
+    <span class="cnt"><b id="qDone">0</b><em>/1000</em></span>
+    <span class="lbl">正确率</span>
+    <span class="cnt" id="qRate">—</span>
+    <span class="lbl">错题</span>
+    <span class="cnt cinnabar" id="wrongN">0</span>
+    <span class="hint">记录存在本机，下次打开还在</span>
+    <button class="reset" id="redoWrong" type="button">重做错题</button>
+    <button class="reset" id="wrongReset" type="button">清空记录</button>
+  </div>
+
+  <div class="qfilter" role="group" aria-label="筛选题目">
+    <button class="fbtn active" data-filter="all" type="button">全部</button>
+    <button class="fbtn" data-filter="todo" type="button">未做</button>
+    <button class="fbtn" data-filter="wrong" type="button">只看错题</button>
+    <label class="qmod"><span>模块</span><select id="qMod" aria-label="按模块筛选"></select></label>
+  </div>
+
+  <div id="qlist"></div>
+  <p class="cap" id="qempty" hidden>这个筛选下暂时没有题目。</p>
+  <p class="cap">这些题是按各模块高频考点编写的<b>练习题</b>，用于自测查漏，<b>不是历年真题</b>。真题请按「资料」一类的指引去找唐山各区历年卷。</p>
+</section>
+</main>
+<script src="assets/nav.js"></script>
+<script src="assets/quiz.js"></script>
+
+</body>
+</html>

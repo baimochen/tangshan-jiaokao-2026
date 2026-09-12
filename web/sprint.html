@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>冲刺计划 · 唐山教考 2026</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;700&display=swap">
+<!-- 主题必须在 app.css 之前落定，否则暗色用户每页都会先闪一下白底。
+     和 nav.js 里的 KEY 是同一个字符串，改一处就得改两处。 -->
+<script>try{var t=localStorage.getItem('jiaokao-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body data-page="sprint">
+<main class="wrap">
+<header class="masthead">
+<p class="eyebrow">唐山工业职业技术大学 · 2026 选聘 · 教育类</p>
+<h1>冲刺计划</h1>
+</header>
+<section class="view" id="sprint">
+<h2><span class="num">冲刺</span>9 月 13 日起，逐日排期</h2>
+  <p class="sec-note">从 <b>9 月 13 日（周日）</b>到 <b>9 月 26 日（周六）</b>共 14 天，每天 3–4 小时。排序原则是<b>先拿确定性分，再啃发散的大头</b>——法规 / 师德 / 职业理念合计约 32%，但内容少、答案唯一，两天能背透，先锁死；教育学与教育心理学这类大块放中间；人文历史只靠刷题顺带积累，不专门花时间。</p>
+  <p class="sec-note">每天要刷的题在「<b>刷题</b>」那一类里，共 120 道、按模块排好，同一天的内容正好对得上。<b>做错的题勾上「记入错题本」</b>，会自动存在你这台机器上——D-1 那天只需要过错题本和「口诀」两页。</p>
+
+  <div class="callout">
+    <h4>这段时间的行政节点，别错过</h4>
+    <p><b>9 月 14 日（周一）– 9 月 18 日（周五）：网上报名</b>，唐山工业职业技术大学官网。建议 15 日之前就报完，别拖到最后一天。<br>
+    <b>9 月 22 日（周二）：打印准考证</b>，同时订好考点附近的住处。<br>
+    <b>9 月 27 日（周日）：笔试</b>。<br>
+    <b>9 月 30 日（周三）：资格复核</b>，提前把学历学位证、报到证等材料备齐。</p>
+    <p>面试在笔试之后、另行通知。<b>面试占 60%，其中答辩考辅导员业务</b>——所以「辅导员」那一类不是笔试完再看的，备考期就要带着过一遍。</p>
+  </div>
+
+  <h4>先定每日节奏，再谈具体内容</h4>
+  <div class="rhythm">
+    <div class="rhythm-row">
+      <span class="when">前 10 分钟</span>
+      <div class="what"><b>回看昨天的错题</b><span>只看错题，不重新做题。这一步比多刷 20 道新题有用。</span></div>
+    </div>
+    <div class="rhythm-row">
+      <span class="when">1.5 小时</span>
+      <div class="what"><b>背当天的新考点</b><span>切到「教育类」「公基」两个分类对着清单背，背完合上页面自己复述一遍。记不住的就抄成一句话贴在桌上。</span></div>
+    </div>
+    <div class="rhythm-row">
+      <span class="when">1 小时</span>
+      <div class="what"><b>刷当天的 60 道题</b><span>只刷对应模块的题。全部做完再对答案，不要做一道看一道。</span></div>
+    </div>
+    <div class="rhythm-row">
+      <span class="when">30 分钟</span>
+      <div class="what"><b>整理错题</b><span>错题记三样：题干关键词、正确答案、你错在哪。不抄整道题。</span></div>
+    </div>
+  </div>
+
+  <div class="prog-bar" style="margin-top:26px">
+    <span class="lbl">进度</span>
+    <span class="cnt"><b id="progDone">0</b> <em>/ 14 天</em></span>
+    <button class="reset" id="progReset" type="button">重置</button>
+  </div>
+  <div class="prog-track"><i id="progFill"></i></div>
+
+  <h4 style="margin-top:0">14 天任务表</h4>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="1" aria-label="9月13日 完成"></label>
+    <div class="day-when"><b>9/13</b><span>D-14 周日</span></div>
+    <div class="day-what">
+      <b>教育法律法规</b>
+      <p>教师六大权利与六大义务；学生权利（体罚侵犯的是<b>人身权 / 人格尊严权</b>、没收手机不还侵犯财产权）；义务教育最本质特征是<b>强制性</b>；法律责任类型四选一（行政处分 / 行政处罚 / 民事 / 刑事）；《未成年人保护法》六大保护；《学生伤害事故处理办法》担责与免责情形；《新时代中小学教师职业行为十项准则》。数字考点单拎出来记：教师申诉 30 日、学生申诉 10 日。</p>
+      <span class="q">刷 60 题</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="2" aria-label="9月14日 完成"></label>
+    <div class="day-when"><b>9/14</b><span>D-13 周一</span></div>
+    <div class="day-what">
+      <b>教师职业道德规范 + 教师职业理念</b>
+      <p>师德六条口诀「三爱两人一终身」，师德灵魂是<b>关爱学生</b>、师德建设第一标准是<b>思想政治素质</b>，「四有」好老师、四个引路人、四个相统一；三观全套——教育观「提素个性创两全」、学生观「两独一发」、教师观角色转变与行为转变。这两块加起来 20%，但一天就能背完，是整场考试性价比最高的投入。</p>
+      <span class="q">刷 60 题</span>
+      <span class="q warn">今天开始报名，先把名报上</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="3" aria-label="9月15日 完成"></label>
+    <div class="day-when"><b>9/15</b><span>D-12 周二</span></div>
+    <div class="day-what">
+      <b>教育心理学 · 心理发展与个别差异</b>
+      <p>皮亚杰四阶段（感知运动 / 前运算 / 具体运算 / 形式运算）及各自标志；埃里克森八阶段，重点记青少年期「自我同一性对角色混乱」；维果茨基<b>最近发展区</b>与支架式教学；科尔伯格三水平六阶段；场独立与场依存。全部考人名与观点的对应。</p>
+      <span class="q">刷 60 题</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="4" aria-label="9月16日 完成"></label>
+    <div class="day-when"><b>9/16</b><span>D-11 周三</span></div>
+    <div class="day-what">
+      <b>教育心理学 · 学习理论</b>
+      <p>行为主义四家：巴甫洛夫经典条件反射、斯金纳操作性条件反射（<b>强化增加行为、惩罚减少行为</b>）、桑代克三律（效果律最重要）、班杜拉观察学习四过程；认知主义：布鲁纳发现学习、奥苏贝尔有意义接受学习与先行组织者、加涅学习结果五分类；建构主义四要素；人本主义罗杰斯非指导性教学。用「教育心理学人物与理论对照」那张导图整体过一遍。</p>
+      <span class="q">刷 60 题</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="5" aria-label="9月17日 完成"></label>
+    <div class="day-when"><b>9/17</b><span>D-10 周四</span></div>
+    <div class="day-what">
+      <b>教育心理学 · 动机、迁移、策略与技能</b>
+      <p>马斯洛需要层次；韦纳归因三维度（内外 / 稳定 / 可控）；班杜拉自我效能感四来源；阿特金森成就动机；迁移的分类与四个理论（桑代克共同要素、贾德概括化、苛勒关系转换、奥苏贝尔认知结构）；学习策略三分类；知识分类与艾宾浩斯遗忘曲线；技能形成阶段；问题解决与创造性思维三特征；态度品德三阶段与心理辅导方法。</p>
+      <span class="q">刷 60 题</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="6" aria-label="9月18日 完成"></label>
+    <div class="day-when"><b>9/18</b><span>D-9 周五</span></div>
+    <div class="day-what">
+      <b>教育学 · 教育概述、身心发展与社会</b>
+      <p><b>这块你手上的超格讲义正好覆盖</b>（第二章 pp.087–115，另加第一章的人物著作与教育概述），可以直接拿那份 PDF 精读：教育起源四说、教育三要素与本质、教育学人物著作、身心发展五规律及教学启示、影响因素四者地位、内发论与外铄论的人物归属、教育与社会、六种教育与社会关系理论。</p>
+      <span class="q warn">讲义里的实战演练没有答案（答案在第 350 页，被裁掉了），得另找题库练</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="7" aria-label="9月19日 完成"></label>
+    <div class="day-when"><b>9/19</b><span>D-8 周六</span></div>
+    <div class="day-what">
+      <b>教育学 · 教育目的、制度与课程</b>
+      <p>教育目的层次结构（教育目的 → 培养目标 → 教学目标）；教育目的三种价值取向；五育并举及各自地位；素质教育内涵；四大学制（壬寅 / 癸卯 / 壬子癸丑 / 壬戌）；课程类型四组分类；课程理论三流派；课程内容三层次；新课改<b>三维目标</b>与综合实践活动。</p>
+      <span class="q">刷 60 题</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="8" aria-label="9月20日 完成"></label>
+    <div class="day-when"><b>9/20</b><span>D-7 周日</span></div>
+    <div class="day-what">
+      <b>教育学 · 教学</b>
+      <p>教学过程四规律；<b>教学原则</b>八条及各自对应的古文名句——这部分几乎全是「给情境反选原则」的考法，要练到看题干就能反应；教学方法（最基本最常用是<b>讲授法</b>）与四类划分；班级授课制的优缺点；教学工作六环节，<b>上课是中心环节</b>；一堂好课的标准；教学评价按功能与按标准的两套分类。这是教育学分册里分值最重的模块。</p>
+      <span class="q">刷 60 题 · 可加练 20 题</span>
+      <span class="q warn">从今天起每天加 40 分钟：定试讲题目、写稿、录像练一遍</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="9" aria-label="9月21日 完成"></label>
+    <div class="day-when"><b>9/21</b><span>D-6 周一</span></div>
+    <div class="day-what">
+      <b>教育学 · 德育、班主任与班级管理</b>
+      <p>德育过程的基本矛盾；德育七原则与五方法；德育途径（<b>思想政治课与其他学科教学是最基本、最经常、最主要的途径</b>）；四种德育模式；班主任工作的<b>中心环节是组织和培养班集体</b>（不是「了解学生」）；班级管理四模式；教师劳动六大特点；师生关系；课外校外教育与三结合教育；教育研究方法。</p>
+      <span class="q">刷 60 题</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="10" aria-label="9月22日 完成"></label>
+    <div class="day-when"><b>9/22</b><span>D-5 周二</span></div>
+    <div class="day-what">
+      <b>公基 · 政治与时政</b>
+      <p>马哲：物质与意识、辩证法三大规律（<b>对立统一是实质与核心</b>）、<b>矛盾分析法是唯物辩证法的根本方法</b>、唯物史观；毛泽东思想活的灵魂；习思想核心要义与「十个明确」；<b>中国式现代化五个特征</b>。然后把「时政」分类的硬点背熟：三个属性、六个力、学龄人口达峰顺序、2026 国常会三项任务、职业教育关键词。</p>
+      <span class="q">刷 60 题</span>
+      <span class="q warn">今天打印准考证，顺手订住处</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="11" aria-label="9月23日 完成"></label>
+    <div class="day-when"><b>9/23</b><span>D-4 周三</span></div>
+    <div class="day-what">
+      <b>公基 · 法律</b>
+      <p>宪法（根本政治制度、公民权利、国家机构职权）；民法典六个分编与诉讼时效三年、离婚冷静期；行政法五类行为的区分（许可 / 处罚 / 强制 / 复议 / 诉讼）；刑法犯罪构成与正当防卫、刑事责任年龄；<b>《事业单位人事管理条例》处分五级：警告、记过、降级、撤职、开除</b>——几乎必考，注意与公务员六种处分区分；劳动合同法试用期期限。</p>
+      <span class="q">刷 60 题</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="12" aria-label="9月24日 完成"></label>
+    <div class="day-when"><b>9/24</b><span>D-3 周四</span></div>
+    <div class="day-what">
+      <b>公基 · 公文写作、经济与公共管理</b>
+      <p>15 种法定公文与适用范围；文种辨析（公告与通告、通知与通报、<b>请示与报告的区别</b>、<b>函用于不相隶属机关</b>）；公文格式——成文日期用<b>阿拉伯数字</b>、发文字号年份用<b>六角括号</b>、标题三要素；行文方向三分。经济抓宏观调控（财政 / 货币政策工具）与分配制度、社会保障四层次；公共管理抓政府职能与管理基本职能（<b>计划和控制</b>）、公共危机管理原则。</p>
+      <span class="q">刷 60 题</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="13" aria-label="9月25日 完成"></label>
+    <div class="day-when"><b>9/25</b><span>D-2 周五</span></div>
+    <div class="day-what">
+      <b>上午：高校 / 职教特色 + 辅导员　下午：全真模考</b>
+      <p>上午补四类考试都不覆盖的空白，也直接对应面试：<b>辅导员</b>——教育部令第 43 号的三大身份、职业守则五条、九大工作职责、师生比 <b>1:200</b>、双线晋升与三「单」；<b>学生管理</b>——41 号令的处分五种与学生申诉 10 日；<b>思政体系</b>——三全育人、十大育人、立德树人；<b>职教特色</b>——职业教育法 2022 修订、产教融合、新双高、双师型教师。下午按 120 分钟计时做一整套完整卷，不查资料、不中断、不中途起身。</p>
+      <span class="q">全真模考 1 套 · 严格计时</span>
+    </div>
+  </div>
+
+  <div class="day">
+    <label class="day-ck"><input type="checkbox" data-day="14" aria-label="9月26日 完成"></label>
+    <div class="day-when"><b>9/26</b><span>D-1 周六</span></div>
+    <div class="day-what">
+      <b>只做两件事：过错题、背口诀</b>
+      <p>过「刷题」里的<b>错题本</b>——14 天攒下的错题都在那儿，重点看每题的解析。然后翻「<b>口诀</b>」那一页，遮住右边自测一轮。下午去看考场、备齐证件文具。晚上早点睡。<b>今天不碰任何新内容。</b></p>
+      <span class="q warn">不刷新题</span>
+    </div>
+  </div>
+
+  <div class="day exam">
+    <label class="day-ck"><input type="checkbox" data-day="15" aria-label="9月27日 考试"></label>
+    <div class="day-when"><b>9/27</b><span>周日</span></div>
+    <div class="day-what">
+      <b>笔试</b>
+      <p>闭卷，一张卷 120 分钟 100 分，全客观题。先扫一遍全卷题量再分配时间，会的先做完，不会的标记后回看——客观题没有过程分，空着就是零分，<b>最后一分钟务必全部涂满</b>。</p>
+    </div>
+  </div>
+</section>
+</main>
+<script src="assets/nav.js"></script>
+
+</body>
+</html>

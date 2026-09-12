@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>模拟考试 · 唐山教考 2026</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;700&display=swap">
+<!-- 主题必须在 app.css 之前落定，否则暗色用户每页都会先闪一下白底。
+     和 nav.js 里的 KEY 是同一个字符串，改一处就得改两处。 -->
+<script>try{var t=localStorage.getItem('jiaokao-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body data-page="mock">
+<main class="wrap">
+<header class="masthead">
+<p class="eyebrow">唐山工业职业技术大学 · 2026 选聘 · 教育类</p>
+<h1>模拟考试</h1>
+</header>
+<section class="view" id="mock">
+<h2><span class="num">模考</span>120 题全真模拟</h2>
+  <p class="sec-note">按考试大纲的模块配比，从题库里随机抽 <b>120 题</b>，限时 <b>120 分钟</b>，一张卷、全客观题。考试过程中<b>不显示对错</b>；交卷后统一判分，给分模块成绩单，<b>答错的自动进错题本</b>。</p>
+
+  <div id="mkSetup">
+    <div class="mk-brief">
+      <div class="mk-tile"><span>题量</span><b>120</b></div>
+      <div class="mk-tile"><span>时长</span><b>120<em>分钟</em></b></div>
+      <div class="mk-tile"><span>满分</span><b>100</b></div>
+      <div class="mk-tile"><span>每题</span><b>0.83<em>分</em></b></div>
+    </div>
+
+    <div class="mod">
+      <p class="mod-h">本卷配比</p>
+      <table class="mk-plan">
+        <thead><tr><th>模块</th><th class="r">题量</th><th class="r">占比</th></tr></thead>
+        <tbody id="mkPlan"></tbody>
+      </table>
+      <p class="cap">配比按考试大纲：<b>教育专业能力测验 60 题 + 公共基础知识 60 题</b>，各半。公基里匀出 6 道给唐山本地政策与校情（本地送分题，不在大纲内但值得拿）。每次开考在模块内随机抽题，不重复同一份卷。</p>
+    </div>
+
+    <div class="mk-go">
+      <button class="mk-start" id="mkStart" type="button">开始考试</button>
+      <p class="cap" id="mkResume" hidden></p>
+    </div>
+  </div>
+
+  <div id="mkExam" hidden>
+    <div class="mk-bar">
+      <span class="mk-clock" id="mkClock">120:00</span>
+      <span class="mk-prog">已答 <b id="mkDone">0</b><em>/1000</em></span>
+      <button class="mk-btn" id="mkCardBtn" type="button">答题卡</button>
+      <button class="mk-btn mk-submit" id="mkSubmitBtn" type="button">交卷</button>
+    </div>
+    <div class="mk-cardpanel" id="mkCardPanel" hidden></div>
+    <div id="mkQ"></div>
+    <div class="mk-nav">
+      <button class="mk-btn" id="mkPrev" type="button">← 上一题</button>
+      <span class="mk-pos" id="mkPos">1 / 120</span>
+      <button class="mk-btn" id="mkNext" type="button">下一题 →</button>
+    </div>
+    <p class="cap">答案随时可改，交卷前不判分。中途关掉页面不要紧，进度和剩余时间都存在本机，回来接着答。</p>
+  </div>
+
+  <div id="mkResult" hidden></div>
+</section>
+</main>
+<script src="assets/nav.js"></script>
+<script src="assets/mock.js"></script>
+
+</body>
+</html>
