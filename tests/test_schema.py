@@ -13,7 +13,8 @@ def fresh_db():
     fd, path = tempfile.mkstemp(suffix='.db')
     os.close(fd)
     conn = sqlite3.connect(path)
-    conn.executescript(open(SCHEMA, encoding='utf-8').read())
+    with open(SCHEMA, encoding='utf-8') as f:
+        conn.executescript(f.read())
     return conn
 
 
@@ -27,6 +28,7 @@ def add_q(conn, qid='e101', n=1, qtype='single', answer='B'):
 class TestSchema(unittest.TestCase):
     def test_五张表都在(self):
         conn = fresh_db()
+        self.addCleanup(conn.close)          # 用完即关，不留给 GC
         names = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         for t in ('questions', 'attempts', 'wrong', 'mock_runs', 'sprint'):
@@ -34,23 +36,27 @@ class TestSchema(unittest.TestCase):
 
     def test_type_只认三种(self):
         conn = fresh_db()
+        self.addCleanup(conn.close)
         with self.assertRaises(sqlite3.IntegrityError):
             add_q(conn, qtype='essay')
 
     def test_id_唯一(self):
         conn = fresh_db()
+        self.addCleanup(conn.close)
         add_q(conn)
         with self.assertRaises(sqlite3.IntegrityError):
             add_q(conn, n=2)
 
     def test_n_唯一(self):
         conn = fresh_db()
+        self.addCleanup(conn.close)
         add_q(conn, qid='e101', n=1)
         with self.assertRaises(sqlite3.IntegrityError):
             add_q(conn, qid='e102', n=1)
 
     def test_删题会连带删掉作答和错题(self):
         conn = fresh_db()
+        self.addCleanup(conn.close)
         conn.execute('PRAGMA foreign_keys = ON')
         add_q(conn)
         conn.execute("INSERT INTO attempts VALUES ('e101','C',0,'2026-09-12')")

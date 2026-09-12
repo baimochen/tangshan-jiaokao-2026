@@ -1,4 +1,9 @@
 -- 题库与学习数据。bank.db 的唯一结构定义。
+
+-- 注意：外键约束是**每连接**开关，下面这行只对执行本脚本的那条连接生效，
+-- 不会写进 bank.db 文件。凡是依赖级联删除的地方（import_bank.py / server.py），
+-- 都必须在自己新建的连接上重新执行一次 PRAGMA foreign_keys = ON，
+-- 否则 ON DELETE CASCADE 会静默失效，留下孤儿行且不报错。
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE questions (
