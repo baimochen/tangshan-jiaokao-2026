@@ -73,6 +73,10 @@ function persist() {
 var SHUF = {};
 function letterAt(i) { return 'ABCD'.charAt(i); }
 function shuffledOpts(q) {
+  /* 判断题不能乱序：「正确」在「错误」前面是有含义的（解析里说「正确」就是上面那个），
+     打乱了顺序会让解析和按钮对不上。直接回原数组：返回后所有调用方都只读
+     （cardHTML 用 .map 生成新数组、posOf 只比 key），没有谁改动它。 */
+  if (q.type === 'judge') return q.options;
   var idx = SHUF[q.id];
   if (!idx) {
     idx = [];
@@ -132,13 +136,26 @@ function optionHTML(q, a, o, di) {
     else if (o.key === a) cls += ' wrong';
     else cls += ' dim';
   }
+  /* 判断题不显示 A/B：选项从来就是「正确 / 错误」两个，标上字母只会让人先在脑子里
+     把字母和文字对一次，而它又不会乱序，字母一点信息都不带。
+     data-k 照旧挂着——点击处理器靠它认所选项（见下面 list 的 click），删了题就点不动。 */
+  var letter = q.type === 'judge' ? '' : '<span class="k">' + letterAt(di) + '</span>';
   return '<li><button class="' + cls + '" type="button" data-q="' + q.id + '" data-k="' + o.key + '"'
-    + (a ? ' disabled' : '') + '><span class="k">' + letterAt(di) + '</span><span class="t">' + o.text + '</span></button></li>';
+    + (a ? ' disabled' : '') + '>' + letter + '<span class="t">' + o.text + '</span></button></li>';
+}
+/* 答案行左侧那个「答案是啥」的标签。单选显示的是选项字母（乱序后它才是用户看到的那个
+   字母），判断题没有字母可指，显示选项的文字——否则卡片上会写「答案 A」，
+   而卡上根本没有叫 A 的按钮。 */
+function answerLabel(q) {
+  if (q.type !== 'judge') return shownKey(q, q.answer);
+  var opts = q.options || [];
+  for (var i = 0; i < opts.length; i++) { if (opts[i].key === q.answer) return opts[i].text; }
+  return q.answer;
 }
 function cardHTML(q) {
   var a = answers[q.id] || null;
   var opts = shuffledOpts(q).map(function (o, i) { return optionHTML(q, a, o, i); }).join('');
-  var ans = a ? '<div class="ans"><span class="key">' + shownKey(q, q.answer) + '</span>' + remapExplain(q, q.explanation) + '</div>' : '';
+  var ans = a ? '<div class="ans"><span class="key">' + answerLabel(q) + '</span>' + remapExplain(q, q.explanation) + '</div>' : '';
   return '<div class="qz' + (isWrong(q) ? ' wrong' : '') + '" data-card="' + q.id + '">'
     + '<p class="stem"><span class="no">' + pad(q.n) + '</span>' + q.stem + '</p>'
     + '<ul class="opts">' + opts + '</ul>' + ans + '</div>';

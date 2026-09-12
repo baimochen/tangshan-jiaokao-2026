@@ -379,6 +379,11 @@ async function bootQuiz() {
 
   /* 引擎首次取数是异步的，等它渲完再断言——不是赌时序。 */
   await quizReady;
+  /* 引擎的两个内部量挂到表面上（和 fetch 一个路子）：BANK 是 loadBank 赋值的 var、
+     shuffledOpts 是函数声明，两者都活在 bootQuiz 的作用域里，不在 DOM 上。
+     必须**等取数回来再挂**——早一步 BANK 还是 null。 */
+  S.bank = BANK;
+  S.shuffledOpts = shuffledOpts;
   return S;
 }
 
@@ -699,6 +704,101 @@ async function quizSection() {
        '服务端回 correct:false，页面就按「答错」渲染（结论取自响应体，不是本地算的）');
     ok(JSON.parse(store['jiaokao-wrong-2026'] || '{}')[q10.id] === 1,
        '这一题因此进了错题本——错题本认的也是服务端判的分');
+  }
+
+  /* ---------- 判断题 · 禁止乱序（合成题） ----------
+     真库 1000 题**全是单选**（type:'single'）：判断题只在大纲里，第四阶段才落库。
+     所以本任务全部覆盖都来自下面这道合成题——别去真库里找判断题，找不到是对的。
+     它临时插在题库最前面，好让它落在第一屏里看得见；引擎取数时把结果另存了一份
+     （loadBank 里的 qs 是新数组），所以断言完摘掉即可，不影响后面几段装配。
+     本段在 quizSection 的最后：新装配一次会清空共用的 localStorage。 */
+  console.log('\n【判断题 · 禁止乱序】');
+  {
+    const jq = { id: 'test-j1', n: 9991, module: '教育学', type: 'judge',
+                 stem: '判断题干', options: [{ key: 'A', text: '正确' }, { key: 'B', text: '错误' }],
+                 answer: 'A', explanation: '解析' };
+    const n0 = BANK.questions.length;
+    BANK.questions.unshift(jq);
+    let J;
+    try {
+      J = await bootQuiz();
+      const fireJ = (el, ev) => J.listeners.filter(l => l.el === el && l.t === 'click')
+                                             .forEach(l => l.fn(ev));
+
+      const order = J.shuffledOpts(jq);
+      ok(order.length === 2, '判断题两个选项');
+      /* 「不乱序」只调一次是**测不出来**的：两个选项洗一次牌，有整整一半的机会
+         正好还是 A、B 原序——删掉判断题那行代码，也有一半的几率是绿的。
+         拿 20 个新题号各调一次（同一题号会命中 SHUF 缓存，只洗一次），
+         只要有一次乱了就红，漏掉的概率 1/2^20。 */
+      const orders = [];
+      for (let i = 0; i < 20; i++) {
+        orders.push(J.shuffledOpts({ id: 'test-j-probe-' + i, type: 'judge', options: jq.options })
+                      .map(o => o.key).join(''));
+      }
+      ok(orders.every(s => s === 'AB'),
+         `判断题不乱序——20 次抽样全是 A/B（对/错的先后有语义，打乱会让解析指错）`);
+
+      /* 对照组：单选题必须照常乱序。没有这一条，上面那句在「乱序被整个关掉」
+         的情况下也会绿——那就成了假绿。 */
+      const singles = J.bank.questions.filter(q => q.type === 'single').slice(0, 20);
+      const someShuffled = singles.some(q => {
+        const got = J.shuffledOpts(q).map(o => o.key).join('');
+        return got !== q.options.map(o => o.key).join('');
+      });
+      ok(someShuffled, '单选题仍然乱序——否则「判断题不乱序」这条是假绿');
+
+      /* 各答一题：.ans 只在已作答的卡上出现。单选题那份是对照组——
+         判断题的界面改动要是波及到单选（把字母整个关掉、答案行也换成文字），
+         没有对照组就看不出来。 */
+      const sq = J.bank.questions.find(q => q.type === 'single');
+      const pick = (id, k) => fireJ(J.byId.qlist, { target: { closest: sel => sel === '.opt'
+        ? { disabled: false, getAttribute: a => (a === 'data-q' ? id : k) } : null } });
+      pick(jq.id, 'B');
+      await settle();
+      pick(sq.id, sq.answer);
+      await settle();
+      /* 全量重渲染一次才看得到带 .ans 的整页（引擎只替换单张卡，
+         桩的 querySelector 恒回 null）。 */
+      fireJ(J.fbtns.find(b => b.getAttribute('data-filter') === 'all'), {});
+      const jAns = JSON.parse(J.store['jiaokao-answers-2026'] || '{}');
+      ok(jAns[jq.id] === 'B' && jAns[sq.id] === sq.answer,
+         '（前提）判断题与单选题各答了一题，两张卡的答案行才会渲染出来');
+
+      const parts = J.byId.qlist.innerHTML.split('<div class="qz').slice(1);
+      const cardOf = id => parts.find(c => c.includes('data-card="' + id + '"')) || '';
+      const judgeCard = cardOf(jq.id), singleCard = cardOf(sq.id);
+
+      /* 「判断题没字母」得先有卡片可看：少了这条前提，渲染整个坏掉
+         （judgeCard 是空串）时它照样绿。 */
+      ok(judgeCard.includes('判断题干') && singleCard.includes(sq.stem),
+         '判断题与对照组单选题都渲染成了卡片（前提）');
+      /* 有卡片还不够：按钮要是压根没建出来，「没有字母」也是在空壳上绿。
+         这里钉住两个按钮的文字确实渲染出来了。 */
+      ok(/<span class="t">正确<\/span>/.test(judgeCard) && /<span class="t">错误<\/span>/.test(judgeCard),
+         '（前提）判断题的两个按钮都渲染了出来（否则「没有字母」是空按钮上的假绿）');
+      ok(!/<span class="k">/.test(judgeCard), '判断题的按钮上没有 A/B 字母');
+      /* 对照组：单选题的字母还在。没有它，「字母被整个关掉」也是绿的。 */
+      ok(/<span class="k">[A-D]<\/span>/.test(singleCard),
+         '（对照）单选题的按钮仍有字母——上面那条不是「字母全没了」造成的假绿');
+      /* data-k 是选项的身份，点击处理器靠它认所选项：删掉判断题就没法点了。
+         （简报里那条「HTML 里没有 data-k="A"」会把判断题做废，这里反过来钉住它。） */
+      ok(/data-k="A"/.test(judgeCard) && /data-k="B"/.test(judgeCard),
+         '判断题的按钮仍挂着 data-k（去掉它题就点不动了）');
+      /* 答案行也不能再是孤零零的字母：卡上没有叫 A 的按钮，写「答案 A」没人看得懂。 */
+      ok(/<div class="ans"><span class="key">正确<\/span>/.test(judgeCard),
+         '判断题的答案行写的是「正确」，不是裸字母 A');
+      /* 对照：单选题的答案行照旧是字母（乱序后显示的那个）。 */
+      ok(/<div class="ans"><span class="key">[A-D]<\/span>/.test(singleCard),
+         '（对照）单选题的答案行照旧是字母');
+    } finally {
+      const i = BANK.questions.indexOf(jq);
+      if (i >= 0) BANK.questions.splice(i, 1);
+    }
+    /* 摘干净了：后面几段装配（模考的抽题按模块配额抽）吃的还得是原来那份题库，
+       合成题漏进去的话，抽题结果和这里的断言都会跟着漂。 */
+    ok(BANK.questions.length === n0 && !BANK.questions.some(q => q.id === jq.id),
+       `合成题已从题库里摘掉（还是 ${BANK.questions.length} 题，后面几段装配不受影响）`);
   }
 }
 
