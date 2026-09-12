@@ -61,6 +61,25 @@ class TestGrade(unittest.TestCase):
     def test_多选顺序不影响判分(self):
         self.assertTrue(grade('multi', 'ABD', 'DBA'))
 
+    def test_作答小写字母也能判对(self):
+        """规范化要转大写：_norm 里的 .upper() 就钉在这一条上。
+
+        现有输入全是规范后的大写形式，删掉 .upper() 它们照样全绿——
+        这条拿小写作答把「大小写不敏感」变成测得出的行为。
+        """
+        self.assertTrue(grade('single', 'B', 'b'))
+
+    def test_作答带首尾空白也能判对(self):
+        """规范化要去空白：_norm 里的 .strip() 就钉在这一条上。
+
+        空白是集合里的一个字符，去不掉就会混进排序结果，' B ' 与 'B' 就不等了。
+        """
+        self.assertTrue(grade('single', 'B', ' B '))
+
+    def test_空白大小写顺序一起上也能判对(self):
+        """去空白、转大写、按字母排序三件事叠在一起，缺一不可。"""
+        self.assertTrue(grade('multi', 'ABD', ' dba '))
+
     def test_没作答算错(self):
         for t in ('single', 'judge', 'multi'):
             self.assertFalse(grade(t, 'B', ''))
@@ -111,6 +130,18 @@ class TestRecordAttempt(unittest.TestCase):
         self.assertTrue(r['correct'])
         self.assertEqual(r['wrong_count'], 0)
         self.assertIsNone(self.wrong())
+
+    def test_做对后返回错题本里的累计错次(self):
+        """错过的题这次做对了，wrong 行以 resolved=1 留着（不删），于是返回值
+        仍是那条记录累计的错次，不是 0——Task 6 的作答接口要把它透给前端。
+
+        这里对着库里那行实际的值断言，不写死数字：SQL 改了计数方式，
+        断言跟着库走，不会同谋地一起变绿。
+        """
+        record_attempt(self.conn, 'e101', 'A')
+        r = record_attempt(self.conn, 'e101', 'B')
+        self.assertTrue(r['correct'])
+        self.assertEqual(r['wrong_count'], self.wrong()[1])
 
     def test_返回值带答案与解析(self):
         """判分结果要能把答案和解析一并回给前端，省一次取题。"""
