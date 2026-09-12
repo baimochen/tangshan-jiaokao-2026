@@ -36,21 +36,41 @@ var byId = {};
 var answers = {};
 try { answers = JSON.parse(localStorage.getItem(AKEY) || '{}') || {}; } catch (e) { answers = {}; }
 
+/* 多选题勾上、还没点「确认作答」的选项：qid → 按点击顺序排的 key 数组。
+   只活在本次页面会话里，刷新即丢（跟没做过的题一样）。全量重渲染时靠它把勾选态
+   画回去，确认作答后立刻清掉——再不点确认就关页面，等于没答过。 */
+var picks = {};
+
 /* 服务端判的分：qid → true/false。只覆盖本次会话里答过的题——
    页面重开后它是空的，isRight() 对那种老记录才退回按答案比。 */
 var verdicts = {};
 
 function pad(n) { return n < 10 ? '0' + n : '' + n; }
 
+/* 与 banklib._norm 同一套规范化：去首尾空白、转大写、去重、排序。
+   顺序和重复都不该影响对错——服务端就是这么判的（_norm 里 set() + sorted()），
+   客户端重开页面后按答案比的那条也必须跟着，否则「多选题答对了、重开页面
+   却变成答错」只在字母不是规范序时冒出来。 */
+function normAns(s) {
+  var seen = {}, out = [];
+  s = (s || '').replace(/^\s+|\s+$/g, '').toUpperCase();
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charAt(i);
+    if (!seen[c]) { seen[c] = 1; out.push(c); }
+  }
+  return out.sort().join('');
+}
+
 /* 判分只信服务端。BANK 里当然也有 answer，但那是渲染用的原料，不是判分依据——
    「多选题少选算错」这类规则只在 banklib.grade 里有一份，客户端不再抄第二份。
    verdicts 里没有的（页面重开带来的、旧版本写下的记录）才按答案比一次，
-   单选下那条与 banklib.grade 等价。 */
+   规范化之后与 banklib.grade 等价：单选、判断题是单个字母，多选是不会因
+   字母顺序而翻案的一串。 */
 function isRight(q) {
   var v = verdicts[q.id];
   if (v !== undefined) return !!v;
   var a = answers[q.id];
-  return !!a && a === q.answer;
+  return !!a && normAns(a) === normAns(q.answer);
 }
 function isWrong(q) { return !!answers[q.id] && !isRight(q); }
 
@@ -129,12 +149,22 @@ function remapExplain(q, s) {
   return out + s.slice(last);
 }
 
+/* 某个选项 key 在不在这个字母串里。单选/判断题传进来的是单个字母，多选是 'ABD'
+   这样一串——同一套判断在三种题型上都成立。（不能写成 o.key === q.answer：
+   多选下 'A' === 'ABD' 恒为假，四个选项会一个不落地掉进 dim，用户看不出哪几项对。） */
+function hasKey(s, key) { return (s || '').indexOf(key) >= 0; }
+
 function optionHTML(q, a, o, di) {
   var cls = 'opt';
   if (a) {
-    if (o.key === q.answer) cls += ' correct';
-    else if (o.key === a) cls += ' wrong';
+    /* 判对错看的是「这一项在不在正确答案里」，不是「它是不是整串答案」。
+       没勾却正确的项照样标 correct——少选的人正需要看到自己漏了哪一项。 */
+    if (hasKey(q.answer, o.key)) cls += ' correct';
+    else if (hasKey(a, o.key)) cls += ' wrong';
     else cls += ' dim';
+  } else if (q.type === 'multi' && hasKey((picks[q.id] || []).join(''), o.key)) {
+    /* 多选题还没确认：勾上的项先标出来，点一下切换勾选态（不判分）。 */
+    cls += ' picked';
   }
   /* 判断题不显示 A/B：选项从来就是「正确 / 错误」两个，标上字母只会让人先在脑子里
      把字母和文字对一次，而它又不会乱序，字母一点信息都不带。
@@ -147,18 +177,33 @@ function optionHTML(q, a, o, di) {
    字母），判断题没有字母可指，显示选项的文字——否则卡片上会写「答案 A」，
    而卡上根本没有叫 A 的按钮。 */
 function answerLabel(q) {
-  if (q.type !== 'judge') return shownKey(q, q.answer);
-  var opts = q.options || [];
-  for (var i = 0; i < opts.length; i++) { if (opts[i].key === q.answer) return opts[i].text; }
-  return q.answer;
+  if (q.type === 'judge') {
+    var opts = q.options || [];
+    for (var i = 0; i < opts.length; i++) { if (opts[i].key === q.answer) return opts[i].text; }
+    return q.answer;
+  }
+  /* 多选的答案是一串字母，每一个都得按乱序后的显示位置换一次——
+     直接写 q.answer（'ABD'）的话，选项一乱序，卡上标的字母就和真正正确的
+     那几个按钮对不上了（和单选显示 shownKey(q, q.answer) 是同一个道理）。 */
+  if (q.type === 'multi') {
+    var ls = [];
+    for (var j = 0; j < q.answer.length; j++) ls.push(shownKey(q, q.answer.charAt(j)));
+    return ls.sort().join('');
+  }
+  return shownKey(q, q.answer);
 }
 function cardHTML(q) {
   var a = answers[q.id] || null;
   var opts = shuffledOpts(q).map(function (o, i) { return optionHTML(q, a, o, i); }).join('');
+  /* 多选题未确认时下方挂「确认作答」：勾选只改 picked，判分等这一步。
+     提交后（a 真）按钮就没了——卡片锁定，只剩对错和解析。 */
+  var sub = (!a && q.type === 'multi')
+    ? '<div class="qmore"><button type="button" data-confirm="' + q.id + '">确认作答</button></div>'
+    : '';
   var ans = a ? '<div class="ans"><span class="key">' + answerLabel(q) + '</span>' + remapExplain(q, q.explanation) + '</div>' : '';
   return '<div class="qz' + (isWrong(q) ? ' wrong' : '') + '" data-card="' + q.id + '">'
     + '<p class="stem"><span class="no">' + pad(q.n) + '</span>' + q.stem + '</p>'
-    + '<ul class="opts">' + opts + '</ul>' + ans + '</div>';
+    + '<ul class="opts">' + opts + '</ul>' + sub + ans + '</div>';
 }
 
 /* 题库有 1000 题，一次性渲染会卡住手机：按页渲染，首屏 40 题，「再显示」逐页追加。
@@ -204,30 +249,58 @@ function stats() {
   if (elWrong) elWrong.textContent = bad;
 }
 
+/* 作答落库。单选/判断题点一下就走这里；多选题先把勾选攒着，点「确认作答」才走。
+   判分只问服务端：correct 由 banklib.grade 判出来，顺带把这次作答记进 bank.db——
+   错题本从此是库里的数据，不再是这个浏览器独有的一份。 */
+async function submitAnswer(q, chosen) {
+  var res;
+  try { res = await api.post('/api/attempts', { qid: q.id, chosen: chosen }); }
+  catch (err) {
+    /* 没记上就当没答：留一份服务端不知道的记录（错题本、统计）只会更乱。 */
+    console.error('作答没能记进题库：' + err.message);
+    return;
+  }
+  answers[q.id] = chosen;         /* 错题自动进错题本：由 isWrong() 判定 */
+  verdicts[q.id] = !!res.correct;
+  delete picks[q.id];             /* 确认过了，勾选态清掉（重做时不该还留着） */
+  persist();
+  var old = list.querySelector('[data-card="' + q.id + '"]');
+  if (old) old.outerHTML = cardHTML(q);
+  stats();
+}
+
 if (list) {
   list.addEventListener('click', async function (e) {
     var more = e.target.closest ? e.target.closest('[data-more]') : null;
     if (more) { shown += PAGE; render(false); return; }
+    /* 多选题的「确认作答」。先于 .opt 判：它挂的是 data-confirm，不是 .opt。
+       把勾选的字母排好序一次交上去——服务端 _norm 本来就排序，这里排一次是为了
+       本机存下的作答也是规范序（重开页面按答案比的那条更不容易翻案）。 */
+    var conf = e.target.closest ? e.target.closest('[data-confirm]') : null;
+    if (conf) {
+      var cid = conf.getAttribute('data-confirm');
+      var cq = byId[cid];
+      if (!cq || answers[cid]) return;
+      var sel = (picks[cid] || []).slice().sort().join('');
+      if (!sel) return;           /* 一项都没勾：不提交，也不记一笔空作答 */
+      await submitAnswer(cq, sel);
+      return;
+    }
     var btn = e.target.closest ? e.target.closest('.opt') : null;
     if (!btn || btn.disabled) return;
     var id = btn.getAttribute('data-q'), k = btn.getAttribute('data-k');
     var q = byId[id];
     if (!q || answers[id]) return;
-    /* 判分只问服务端：correct 由 banklib.grade 判出来，顺带把这次作答
-       记进 bank.db——错题本从此是库里的数据，不再是这个浏览器独有的一份。 */
-    var res;
-    try { res = await api.post('/api/attempts', { qid: id, chosen: k }); }
-    catch (err) {
-      /* 没记上就当没答：留一份服务端不知道的记录（错题本、统计）只会更乱。 */
-      console.error('作答没能记进题库：' + err.message);
+    /* 多选题：点一下只切换勾选态，不判分——判分留给「确认作答」。 */
+    if (q.type === 'multi') {
+      var cur = picks[id] || (picks[id] = []);
+      var at = cur.indexOf(k);
+      if (at >= 0) cur.splice(at, 1); else cur.push(k);
+      var card = list.querySelector('[data-card="' + id + '"]');
+      if (card) card.outerHTML = cardHTML(q);
       return;
     }
-    answers[id] = k;              /* 错题自动进错题本：由 isWrong() 判定 */
-    verdicts[id] = !!res.correct;
-    persist();
-    var old = list.querySelector('[data-card="' + id + '"]');
-    if (old) old.outerHTML = cardHTML(q);
-    stats();
+    await submitAnswer(q, k);
   });
 }
 
@@ -263,12 +336,12 @@ function buildModSelect() {
 
 var redo = document.getElementById('redoWrong');
 if (redo) redo.addEventListener('click', function () {
-  qs.forEach(function (q) { if (isWrong(q)) { delete answers[q.id]; delete verdicts[q.id]; } });
+  qs.forEach(function (q) { if (isWrong(q)) { delete answers[q.id]; delete verdicts[q.id]; delete picks[q.id]; } });
   persist(); render(true); stats();
 });
 var wReset = document.getElementById('wrongReset');
 if (wReset) wReset.addEventListener('click', function () {
-  answers = {}; verdicts = {}; persist();
+  answers = {}; verdicts = {}; picks = {}; persist();
   filter = 'all'; modFilter = '';
   if (modSel) modSel.value = '';
   fbtns.forEach(function (x) { x.classList.toggle('active', x.getAttribute('data-filter') === 'all'); });

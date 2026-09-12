@@ -363,12 +363,17 @@ if (PAGE_SCRIPTS.join('|') !== WANT_SCRIPTS.join('|')) {
   process.exit(1);
 }
 
-async function bootQuiz() {
+async function bootQuiz(opts) {
+  opts = opts || {};
   const nav = [];
   /* readyState='loading'：nav.js 因此只把 window.NAV 放出来、不往 DOM 里挂导航。
      本页引擎压根不查导航（导航本身由 node tests/check_dom.js 验），这里要的只是
-     那份导航表——建 section 与 .nav-list a 都用它，不再从 HTML 里正则抓 <a href="#x">。 */
-  const S = makeStub(QUIZ_HTML, nav, { idsFromHtml: true, readyState: 'loading', hiddenIds: ['qempty'] });
+     那份导航表——建 section 与 .nav-list a 都用它，不再从 HTML 里正则抓 <a href="#x">。
+     seedStore 用来模拟「页面重开」：本机 localStorage 里带着上次的作答记录再装配一次
+     （见「多选题 · 重开页面」那段）。 */
+  const S = makeStub(QUIZ_HTML, nav, { idsFromHtml: true, readyState: 'loading',
+                                       hiddenIds: ['qempty'],
+                                       seedStore: opts.seedStore || null });
   S.fetch = installFetchStub();   /* 断言要看请求记录与 override 口子 */
 
   /* 按页面里的实际顺序 eval。索引 0 是 nav.js，要单独接一下它的产物。 */
@@ -704,6 +709,218 @@ async function quizSection() {
        '服务端回 correct:false，页面就按「答错」渲染（结论取自响应体，不是本地算的）');
     ok(JSON.parse(store['jiaokao-wrong-2026'] || '{}')[q10.id] === 1,
        '这一题因此进了错题本——错题本认的也是服务端判的分');
+  }
+
+  /* ---------- 多选题 · 勾选后确认（合成题） ----------
+     真库 1000 题**全是单选**（type:'single'）：多选只在第四阶段才落库，所以本任务
+     全部覆盖都来自下面这些合成题——别去真库里找多选题，找不到是对的。
+     它们临时插在题库最前面（落在第一屏里看得见），断言完摘掉；新装配一次会清空
+     共用的 localStorage，所以这段自己从头攒作答。 */
+  console.log('\n【多选题 · 勾选后确认】');
+  {
+    /* 八道同答案的合成题（答案 ABD、选项 A/B/C/D）。要八道是为了「答案行显示的
+       字母」那条：选项乱序是**每题随机**洗一次的，只有一道题时恰好洗成原序
+       （1/24 的机会）会让那条变成假绿；八道全洗成原序的概率 (1/24)^8，等于不会发生。 */
+    const MANS = 'ABD';
+    const mkQ = i => ({ id: 'test-m' + i, n: 9990 - i, module: '教育学', type: 'multi',
+                        stem: '多选题干' + i,
+                        options: [{ key: 'A', text: '甲' }, { key: 'B', text: '乙' },
+                                  { key: 'C', text: '丙' }, { key: 'D', text: '丁' }],
+                        answer: MANS,
+                        /* 解析里刻意用单字母的选项指代：remapExplain 的逐字母邻接判断
+                           会把连着的「ABD」整串挡掉（A 右邻是字母、B 左右都是字母），
+                           那是任务 14 要扩的地方，本任务不碰——见 ruling 3。 */
+                        explanation: '故选 A。' });
+    const mqs = [0, 1, 2, 3, 4, 5, 6, 7].map(mkQ);
+    const n0 = BANK.questions.length;
+    mqs.forEach(q => BANK.questions.unshift(q));
+    try {
+      const M = await bootQuiz();
+      const byId = M.byId, store = M.store;
+      const fireM = (el, ev) => M.listeners.filter(l => l.el === el && l.t === 'click')
+                                             .forEach(l => l.fn(ev));
+      const posts = () => M.fetch.calls.filter(c => c.path === '/api/attempts' && c.method === 'POST');
+      const allBtn = M.fbtns.find(b => b.getAttribute('data-filter') === 'all');
+      /* 桩里 querySelector 恒回 null，引擎「只替换单张卡」那条路走不到——
+         整体重渲染一次才看得到新的勾选态（和上面几段同一个路子）。 */
+      const redraw = () => fireM(allBtn, {});
+      const html = () => byId.qlist.innerHTML;
+      const cardOf = (h, id) => h.split('<div class="qz').slice(1)
+                                  .find(c => c.includes('data-card="' + id + '"')) || '';
+      /* 每个选项挂着什么 class，按 key 拼成 'A:correct,B:dim,…' 比。整串比而不是
+         数「correct 有几个」：漏标、错标、多标（比如答完还留着 picked）都会露馅，
+         也不依赖选项渲染的先后（乱序）。 */
+      const clsPairs = (h, id) => [...cardOf(h, id).matchAll(/class="opt ([^"]+)"[^>]*data-k="([^"]+)"/g)]
+                                   .map(m => m[2] + ':' + m[1]).sort().join(',');
+      const pickedOf = (h, id) => [...cardOf(h, id).matchAll(/class="opt picked"[^>]*data-k="([^"]+)"/g)].map(m => m[1]);
+      /* cardOf 的片段是从 `<div class="qz` **之后**切起的，`class="qz wrong"` 那个字面量
+         在片段里被切掉了一半——判「这张卡是不是错题卡」必须看整页，不能看片段。 */
+      const isWrongCard = (h, id) => h.includes('class="qz wrong" data-card="' + id + '"');
+      const clickOpt = (id, k) => fireM(byId.qlist, { target: { closest: sel => sel === '.opt'
+        ? { disabled: false, getAttribute: a => (a === 'data-q' ? id : k) } : null } });
+      const clickConfirm = id => fireM(byId.qlist, { target: { closest: sel => sel === '[data-confirm]'
+        ? { getAttribute: a => (a === 'data-confirm' ? id : null) } : null } });
+      const m0 = mqs[0], m1 = mqs[1], m2 = mqs[2];
+
+      /* ---- 1. 点选项只切换勾选，不判分 ---- */
+      ok(cardOf(html(), m0.id).includes('data-confirm="' + m0.id + '"'),
+         '多选题未确认时下方有「确认作答」按钮');
+      ok(!/class="opt (correct|wrong|dim|picked)/.test(cardOf(html(), m0.id)),
+         '（前提）未作答时四个选项一个标记都没有');
+
+      const p0 = posts().length;
+      clickOpt(m0.id, 'A'); await settle();
+      ok(posts().length === p0, `点选项不提交（POST /api/attempts 仍是 ${posts().length} 次）`);
+      ok(!(m0.id in JSON.parse(store['jiaokao-answers-2026'] || '{}')),
+         '未确认前本机不记这一题（勾上只是勾上）');
+      redraw();
+      ok(pickedOf(html(), m0.id).join('') === 'A',
+         `点一下把 A 标成已勾选（实际 ${pickedOf(html(), m0.id).join('') || '无'}）`);
+
+      /* 多选是「切换」不是「选中」：再点一下要能取消 */
+      clickOpt(m0.id, 'A'); await settle(); redraw();
+      ok(pickedOf(html(), m0.id).length === 0, '再点一下取消勾选（切换而不是累积）');
+      ok(posts().length === p0, '取消勾选也不提交');
+
+      /* ---- 2. 点「确认作答」才把勾选的字母交上去 ---- */
+      /* 故意按 D、A、B 的顺序点：钉的是「交上去的是勾选的那几个字母」，
+         不是字母串的某种拼法——服务端 _norm 本来就排序，拼法在判分上看不出差别
+         （ruling 4）。 */
+      ['D', 'A', 'B'].forEach(k => clickOpt(m0.id, k));
+      await settle(); redraw();
+      ok(pickedOf(html(), m0.id).sort().join('') === MANS,
+         `三个字母都勾上了（实际 ${pickedOf(html(), m0.id).join('')}）`);
+
+      const p1 = posts().length;
+      clickConfirm(m0.id); await settle();
+      const sent = posts();
+      ok(sent.length === p1 + 1, `点「确认作答」才发请求（${p1} → ${sent.length}）`);
+      const chosen0 = sent.length ? sent[sent.length - 1].body.chosen : '';
+      ok(sent.length && sent[sent.length - 1].body.qid === m0.id
+         && chosen0.split('').sort().join('') === MANS,
+         `请求体是这道题与勾选的字母串（${m0.id} → ${chosen0}）`);
+      ok(JSON.parse(store['jiaokao-answers-2026'] || '{}')[m0.id] === chosen0,
+         '确认后本机才记上这一题');
+
+      /* ---- 3. 提交后锁定，按响应体渲染对错 ---- */
+      redraw();
+      const c0 = cardOf(html(), m0.id);
+      ok(!c0.includes('data-confirm'), '提交后「确认作答」按钮消失（卡片锁定）');
+      /* 这一条正是 ruling 2 的病灶：o.key === q.answer 在多选下恒假（'A' === 'ABD'），
+         修之前四个选项会一个不剩地掉进 dim，用户看不出哪几项是对的。
+         全对时 A/B/D 标 correct、没勾的错项 C 标 dim（dim 在这里是**对**的：
+         C 本来就不是答案，用户也没勾它）。 */
+      ok(clsPairs(html(), m0.id) === 'A:correct,B:correct,C:dim,D:correct',
+         `全对：三项 correct、一项 dim（实际 ${clsPairs(html(), m0.id) || '无'}）`);
+      /* 解析也一起渲染出来。合成题的解析是「故选 A。」——那个 A 是**原始 key**，
+         卡片上必须换成乱序后显示的那个字母，也就是标为 correct 的 A 项显示的字母。
+         （本段的合成题刻意不用「故选 ABD」这种多字母指代：remapExplain 的逐字母
+         邻接判断会把连着的整串挡掉，那是任务 14 的地盘，见 ruling 3。） */
+      const dispOf = (h, id, key) => (cardOf(h, id).match(new RegExp('data-k="' + key + '"[^>]*><span class="k">([A-D])</span>')) || [])[1] || '';
+      ok(c0.includes('故选 ' + dispOf(html(), m0.id, 'A') + '。'),
+         `解析里的「故选 A」跟着选项重映射（渲染成「故选 ${dispOf(html(), m0.id, 'A')}。」）`);
+      ok(!isWrongCard(html(), m0.id), '全对不标成错题卡');
+      ok(byId.wrongN.textContent == 0 && byId.qRate.textContent === '100%',
+         `全对：错题数 ${byId.wrongN.textContent}、正确率 ${byId.qRate.textContent}`);
+
+      /* 对照组：单选点一下仍然直接判分，没有「确认作答」这一步。
+         少了它，「多选改动把单选也改成两段式」不会有任何断言吭声。 */
+      const sq = BANK.questions.find(q => q.type === 'single');
+      ok(!cardOf(html(), sq.id).includes('data-confirm'), '（对照）单选题没有「确认作答」按钮');
+      clickOpt(sq.id, sq.answer); await settle();
+      ok(JSON.parse(store['jiaokao-answers-2026'] || '{}')[sq.id] === sq.answer,
+         '（对照）单选题点一下就直接提交判分');
+
+      /* ---- 4. 少选算错（判分与 banklib.grade 一致） ---- */
+      clickOpt(m1.id, 'A'); clickOpt(m1.id, 'B');
+      await settle(); clickConfirm(m1.id); await settle(); redraw();
+      ok(isWrongCard(html(), m1.id),
+         '少选（勾了 AB，答案是 ABD）判错——卡上标了 wrong');
+      ok(byId.wrongN.textContent == 1, `这一题进了错题本（错题数 ${byId.wrongN.textContent}）`);
+      ok(JSON.parse(store['jiaokao-wrong-2026'] || '{}')[m1.id] === 1, '错题本里记的是这一题');
+      /* 勾错的标错、漏勾的照样标出正确答案：少选的人需要看到漏了 D。
+         （这一串和「全对」那条一样，是对的——着色只反映**答案**，不反映用户勾了什么。） */
+      ok(clsPairs(html(), m1.id) === 'A:correct,B:correct,C:dim,D:correct',
+         `少选也把漏掉的那一项标出来（实际 ${clsPairs(html(), m1.id) || '无'}）`);
+
+      /* ---- 5. 勾多了算错，多勾的那一项标 wrong ---- */
+      ['A', 'B', 'C', 'D'].forEach(k => clickOpt(m2.id, k));
+      await settle(); clickConfirm(m2.id); await settle(); redraw();
+      /* 多勾的 C 标 wrong（勾了又不是答案）；A/B/D 仍是 correct。
+         这条钉住 wrong 与 correct 的判据不同：correct 看答案，wrong 看「勾了但不对」。 */
+      ok(clsPairs(html(), m2.id) === 'A:correct,B:correct,C:wrong,D:correct',
+         `多勾的 C 标成 wrong（实际 ${clsPairs(html(), m2.id) || '无'}）`);
+
+      /* ---- 6. 提交过的题点不动了 ---- */
+      const p2 = posts().length;
+      clickOpt(m0.id, 'C'); clickOpt(m1.id, 'C'); await settle();
+      ok(posts().length === p2, '已提交的题再点选项不发请求（卡片锁住了）');
+      redraw();
+      ok(JSON.parse(store['jiaokao-answers-2026'])[m0.id] === chosen0, '已提交的作答不会被点乱');
+
+      /* ---- 7. 答案行显示的字母，必须是那几项**显示出来**的字母 ---- */
+      /* 其余的合成题也答对，凑够乱序样本 */
+      for (const q of mqs.slice(3)) {
+        ['A', 'B', 'D'].forEach(k => clickOpt(q.id, k));
+        await settle(); clickConfirm(q.id); await settle();
+      }
+      redraw();
+      {
+        const bad = [];
+        let checked = 0, shuf = 0;
+        for (const q of mqs) {
+          const c = cardOf(html(), q.id);
+          const label = (c.match(/class="ans"><span class="key">([A-D]+)<\/span>/) || [])[1] || '';
+          const corr = [...c.matchAll(/class="opt correct"[^>]*data-k="([^"]+)"[^>]*><span class="k">([A-D])</g)].map(x => x[2]);
+          if (!label || corr.length !== 3) { bad.push(`${q.id}: 答案行=${label || '无'}、correct 项 ${corr.length} 个`); continue; }
+          checked++;
+          /* 两个来源互相印证：answerLabel（answer 逐字母过 shownKey）与
+             optionHTML（按位置给显示字母）。哪边跟乱序脱了节都在这里露馅——
+             答案行要是直接写 q.answer（'ABD'），乱序后就和 correct 项对不上。 */
+          if (corr.slice().sort().join('') !== label)
+            bad.push(`${q.id}: 答案行写 ${label}，标为正确的选项显示为 ${corr.join('')}`);
+          if (M.shuffledOpts(q).map(o => o.key).join('') !== 'ABCD') shuf++;
+        }
+        ok(checked === mqs.length, `${mqs.length} 道多选题都渲染出了答案行（${checked}/${mqs.length}）`);
+        ok(shuf > 0, `其中 ${shuf}/${mqs.length} 道的选项确实洗过牌——否则下面那条是假绿`);
+        ok(bad.length === 0, bad.length ? bad.slice(0, 3).join('; ')
+                                        : '答案行显示的字母与标为正确的选项一致（乱序没让答案行指错项）');
+      }
+
+      /* ---- 8. 重开页面：答对的多选题必须还算对 ---- */
+      /* verdicts 只活在本次会话里，重开页面后 isRight 退回按答案比。多选下这条退回
+         必须与 banklib.grade 等价（顺序不该影响对错），否则用户答对了、重开页面
+         却看到「错」——这是用户看得见的失败，不是调用约定。 */
+      const stored = store['jiaokao-answers-2026'];
+      const wrongBefore = byId.wrongN.textContent;
+      ok(JSON.parse(stored)[m0.id], '（前提）本机存着 m0 的作答记录，重开才有的比');
+      const M2 = await bootQuiz({ seedStore: { 'jiaokao-answers-2026': stored } });
+      const h2 = M2.byId.qlist.innerHTML;
+      const c2 = h2.split('<div class="qz').slice(1)
+                   .find(c => c.includes('data-card="' + m0.id + '"')) || '';
+      ok(c2.includes('class="ans"'), '（前提）重开后这道题仍带着答案行（记录确实读回来了）');
+      ok(!isWrongCard(h2, m0.id), '重开页面后答对的多选题仍算对（没有「答对了却判错」）');
+      ok(M2.byId.wrongN.textContent === wrongBefore,
+         `重开后错题数与关页前一致（${wrongBefore} → ${M2.byId.wrongN.textContent}）`);
+
+      /* 本机存着的字母顺序未必规范：旧版本写下的、或别的标签页写的记录都可能是
+         'DAB' 这种序。判分退回按答案比时必须和 banklib._norm 一样排序去重，
+         否则同一批字母、只是顺序不同，就会被判成错。 */
+      const M3 = await bootQuiz({ seedStore: {
+        'jiaokao-answers-2026': JSON.stringify({ [m0.id]: 'DAB' }) } });
+      const h3 = M3.byId.qlist.innerHTML;
+      const c3 = h3.split('<div class="qz').slice(1)
+                   .find(c => c.includes('data-card="' + m0.id + '"')) || '';
+      ok(c3.includes('class="ans"'), '（前提）非规范序的记录也渲染出了答案行');
+      ok(!isWrongCard(h3, m0.id), '记录里字母顺序不规范（DAB）时，答对的题仍算对');
+      ok(M3.byId.wrongN.textContent == 0,
+         `只有这一题作答、而且它是对的：错题数 ${M3.byId.wrongN.textContent}`);
+    } finally {
+      mqs.forEach(q => { const i = BANK.questions.indexOf(q); if (i >= 0) BANK.questions.splice(i, 1); });
+    }
+    /* 摘干净了：后面几段装配（模考的抽题按模块配额抽）吃的还得是原来那份题库。 */
+    ok(BANK.questions.length === n0 && !BANK.questions.some(q => q.id === mqs[0].id),
+       `合成题已从题库里摘掉（还是 ${BANK.questions.length} 题，后面几段装配不受影响）`);
   }
 
   /* ---------- 判断题 · 禁止乱序（合成题） ----------
