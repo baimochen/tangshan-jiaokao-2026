@@ -195,6 +195,16 @@ function mkUpdateProg() {
   if (pv) pv.disabled = (mkState.i === 0);
   if (nx) nx.disabled = (mkState.i === mkN - 1);
 }
+/* 题库里到底有没有判断题/多选题。练兵版承诺的「判 X · 多 Y」只有在题库真供得起
+   时才算数——真库今天 1000 题全是单选，勾上也只能抽出单选（服务端 mock_pick 会
+   退回单选）。所以一道都没有时开关不出现：**界面不承诺卷子里没有的题型**。
+   这是「题库里有什么」的数据判断，不是配比表第二份——配比仍然只在服务端。 */
+function mkHasTypes() {
+  return (mkBank || []).some(function (q) {
+    return q.type === 'judge' || q.type === 'multi';
+  });
+}
+
 /* 设置面板的配比表。数据来自服务端的 parts / partsWithTypes——**别在这里再写
    一份配比**，写死的话服务端改了配比、页面还在按老配比预告，考生拿到的是另一张卷子。
 
@@ -202,10 +212,12 @@ function mkUpdateProg() {
    改不得——配比表本来就是这一格填的，开关跟它同源）。开关状态只影响下一次开考。 */
 function mkRenderPlan() {
   var tb = mk$('mkPlan'); if (!tb) return;
-  var rows = '<tr class="withtypes"><td colspan="3"><label>'
+  var hasTypes = mkHasTypes();
+  var rows = '';
+  if (hasTypes) rows += '<tr class="withtypes"><td colspan="3"><label>'
     + '<input type="checkbox" data-mktypes="1"' + (mkWithTypes ? ' checked' : '') + '>'
     + '含多选/判断（练兵）</label></td></tr>';
-  (mkWithTypes ? mkPlanTypes : mkPlan).forEach(function (P, pi) {
+  ((mkWithTypes && hasTypes) ? mkPlanTypes : mkPlan).forEach(function (P, pi) {
     rows += '<tr class="grp"><td colspan="3">' + mkPartName(pi)
       + '<span class="pn">' + P.n + ' 题 · ' + Math.round(P.n / mkN * 100) + '%</span></td></tr>';
     var g = null;
@@ -262,7 +274,7 @@ function mkRenderResult(res) {
   el.innerHTML = '<div class="mk-score ' + v + '">'
     + '<p class="verdict">' + word + '</p>'
     + '<p class="big">' + (Math.round(pts * 10) / 10) + '<em>/ 100</em></p>'
-    + '<p class="sub"><span>' + (mkState && mkState.withTypes
+    + '<p class="sub"><span>' + (mkState && mkState.withTypes && mkHasTypes()
         ? '练兵版 · 含判断/多选' : '标准版 · 全单选') + '</span>'
     + '<span>答对 <b>' + res.right + '</b> / ' + total + ' 题</span>'
     + '<span>用时 <b>' + mkFmtUsed(res.used || 0) + '</b></span>'

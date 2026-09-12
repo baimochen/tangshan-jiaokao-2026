@@ -1767,6 +1767,31 @@ async function mockTypesSection() {
   BANK.questions.splice(0, 2);
   ok(BANK.questions.length === n0 && !BANK.questions.some(q => q.id === jq.id || q.id === mq.id),
      `合成题已从题库里摘掉（还是 ${BANK.questions.length} 题，后面几段装配不受影响）`);
+
+  /* 摘掉之后题库又回到真库的样子：1000 题全单选。这时**界面不许承诺卷子里
+     没有的题型**——练兵版开关根本不出现（配比表于是也不可能写「判 X · 多 Y」）。
+     把 mock.js 的 mkHasTypes() 改成恒 true、或拆掉 mkRenderPlan 里的
+     if (hasTypes) 守卫，下面这条立刻红。 */
+  console.log('\n【练兵版 · 题库没有判断/多选时不承诺】');
+  {
+    const S = await bootMock();
+    const plan = S.byId.mkPlan.innerHTML;
+    ok(!/data-mktypes/.test(plan), '题库里没有判断/多选时，练兵版开关不出现（不承诺没有的题型）');
+  }
+  {
+    /* 存档上写着 withTypes:true（题库换过、这一场是先前开的），题库里却一道
+       判断/多选都没有——成绩单也不许印「练兵版 · 含判断/多选」。
+       把 mkRenderResult 里那句的 && mkHasTypes() 拆掉，这条立刻红。 */
+    const now = Date.now();
+    const run = { ids: [BANK.questions[0].id], parts: [{ name: '第X部分 · 合成', n: 1 }],
+                  answers: {}, i: 0, withTypes: true, startedAt: now,
+                  endsAt: now + 3600000, submitted: false, submittedAt: 0 };
+    const S = await bootMock({ run });
+    firesOn(S, S.byId.mkSubmitBtn, {}); await settle();
+    const res = S.byId.mkResult.innerHTML;
+    ok(/标准版 · 全单选/.test(res) && !/练兵版/.test(res),
+       '题库没有判断/多选时，成绩单不印「练兵版 · 含判断/多选」');
+  }
 }
 
 /* ---------- 首页：入口卡片 + 导入旧版记录 ---------- */
