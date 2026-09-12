@@ -42,10 +42,13 @@ SECTION_IDS = set(TITLES)
 EXTRA_TITLES = {'index': '总览', 'wrong': '错题本'}
 
 # 哪些页面要额外脚本。nav.js 由模板统一加载，不在这里。
-# 注意 quiz.js / mock.js / wrong.js 由后续任务产出，此刻还不存在——
+# 注意 mock.js / wrong.js 由后续任务产出，此刻还不存在——
 # 页面先按计划引着，缺文件的 404 是阶段性的，不是这里该补的。
+# quiz 多引一个 bank.js：刷题引擎取数用的是它挂的 window.api，
+# **必须排在 quiz.js 之前**，否则引擎一取数就 ReferenceError。
 SCRIPTS = {
-    'quiz': '<script src="assets/quiz.js"></script>\n',
+    'quiz': ('<script src="assets/bank.js"></script>\n'
+             '<script src="assets/quiz.js"></script>\n'),
     'mock': '<script src="assets/mock.js"></script>\n',
     'wrong': '<script src="assets/wrong.js"></script>\n',
 }

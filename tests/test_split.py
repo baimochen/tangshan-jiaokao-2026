@@ -289,8 +289,11 @@ class TestEntryPoints(unittest.TestCase):
                         'nav.js 必须在 home.js 之前：NAV 由 nav.js 提供')
 
     def test_page_scripts_match_the_plan(self):
+        # quiz 在 quiz.js 之前多引一个 bank.js：刷题引擎取数用的是它挂的 window.api。
+        # 顺序是断言的一部分——调过来引擎就取不到数。
         want = {'index': ['assets/home.js'],
-                'quiz': ['assets/quiz.js'], 'mock': ['assets/mock.js'],
+                'quiz': ['assets/bank.js', 'assets/quiz.js'],
+                'mock': ['assets/mock.js'],
                 'wrong': ['assets/wrong.js']}
         for sid in ALL_IDS:
             with self.subTest(page=sid):
