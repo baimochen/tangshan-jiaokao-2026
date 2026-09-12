@@ -1,0 +1,136 @@
+# -*- coding: utf-8 -*-
+"""导入校验：8 条规则，每条都要有一个「坏数据被拒」的测试。"""
+import copy
+import json
+import os
+import shutil
+import tempfile
+import unittest
+
+from import_bank import validate, SECTION_OF, open_db, import_bank
+
+GOOD = {
+    'id': 'e101', 'n': 1, 'module': '教育学', 'stem': '题干',
+    'options': [{'key': 'A', 'text': '甲'}, {'key': 'B', 'text': '乙'},
+                {'key': 'C', 'text': '丙'}, {'key': 'D', 'text': '丁'}],
+    'answer': 'B', 'explanation': '解析',
+}
+
+
+def bad(**kw):
+    q = copy.deepcopy(GOOD)
+    for k, v in kw.items():
+        if v is None:
+            q.pop(k, None)
+        else:
+            q[k] = v
+    return [q]
+
+
+class TestValidate(unittest.TestCase):
+    def test_好数据通过(self):
+        self.assertEqual(validate([copy.deepcopy(GOOD)]), [])
+
+    def test_拒绝重复id(self):
+        errs = validate([copy.deepcopy(GOOD), copy.deepcopy(GOOD)])
+        # 第二条 n 也得改，否则先撞 n 唯一——这里显式只关心 id
+        self.assertTrue(any('重复' in e and 'id' in e for e in errs), errs)
+
+    def test_拒绝未知模块(self):
+        errs = validate(bad(module='不存在的模块'))
+        self.assertTrue(any('未知模块' in e for e in errs), errs)
+
+    def test_拒绝答案字母不在选项里(self):
+        errs = validate(bad(answer='E'))
+        # GOOD 有 A-D 四个选项，E 不在其中
+        self.assertTrue(any('不在选项' in e for e in errs), errs)
+
+    def test_拒绝多选答案未升序(self):
+        # 必须显式标 multi，否则会被当成单选撞上「只应有 1 个字母」，
+        # 红了也不是因为升序这条规则
+        errs = validate(bad(type='multi', answer='BA'))
+        self.assertTrue(any('升序' in e for e in errs), errs)
+
+    def test_拒绝多选答案有重复字母(self):
+        # 'AA' 已按升序，唯一会红的就是重复字母这条
+        errs = validate(bad(type='multi', answer='AA'))
+        self.assertTrue(any('重复字母' in e for e in errs), errs)
+
+    def test_拒绝判断题选项数不是二(self):
+        # 4 个选项 + judge 类型，红的必须是选项数那条，不是答案长度那条
+        errs = validate(bad(type='judge'))
+        self.assertTrue(any('判断题' in e and '2 个选项' in e for e in errs), errs)
+
+    def test_拒绝空解析(self):
+        errs = validate(bad(explanation='   '))
+        self.assertTrue(any('解析为空' in e for e in errs), errs)
+
+    def test_拒绝本地题没有来源(self):
+        q = copy.deepcopy(GOOD)
+        q['module'] = '唐山本地政策与时政'
+        self.assertTrue(any('来源' in e for e in validate([q])))
+
+    def test_拒绝解析与答案不自洽(self):
+        # 解析写「故选 C」，答案却是 B
+        errs = validate(bad(explanation='故选 C。'))
+        self.assertTrue(any('解析写' in e for e in errs), errs)
+
+
+class TestSectionMap(unittest.TestCase):
+    def test_映射覆盖全部13个模块(self):
+        mods = ['教育学', '教育心理学', '教育法律法规', '教师职业理念与职业道德',
+                '公共基础 · 政治与时政', '公共基础 · 法律', '公共基础 · 公文写作',
+                '公共基础 · 经济、管理与常识', '高校辅导员', '职业教育与高等教育',
+                '人文历史与科技常识', '唐山工业职业技术大学校情', '唐山本地政策与时政']
+        for m in mods:
+            self.assertIn(m, SECTION_OF, f'模块「{m}」没有 section 映射')
+
+
+class TestImportBank(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.db = os.path.join(self.dir, 'bank.db')
+        self.json_path = os.path.join(self.dir, 'b.json')
+
+    def write_json(self, questions):
+        with open(self.json_path, 'w', encoding='utf-8') as f:
+            json.dump({'questions': questions}, f, ensure_ascii=False)
+
+    def test_好题库入库并返回题数(self):
+        self.write_json([copy.deepcopy(GOOD)])
+        self.assertEqual(import_bank(self.json_path, self.db), 1)
+        conn = open_db(self.db)
+        self.addCleanup(conn.close)
+        row = conn.execute('SELECT id,section,type,batch FROM questions').fetchone()
+        self.assertEqual(row, ('e101', 'edu', 'single', 1))
+
+    def test_坏题库一题都不写(self):
+        # 先入库一题好数据，再用坏数据覆盖导入：校验不过就该整批不写，
+        # 旧数据原样保留（validate 在写之前跑）
+        self.write_json([copy.deepcopy(GOOD)])
+        self.assertEqual(import_bank(self.json_path, self.db), 1)
+        self.write_json([copy.deepcopy(GOOD), copy.deepcopy(GOOD)])
+        self.assertEqual(import_bank(self.json_path, self.db), 0)
+        conn = open_db(self.db)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute('SELECT COUNT(*) FROM questions').fetchone()[0], 1)
+
+    def test_新连接上删题连带删除作答与错题(self):
+        # 真实使用路径：open_db() 是全新连接，从没跑过 schema.sql。
+        # schema.sql 里的 PRAGMA 只对执行它的那条连接生效，
+        # 若 open_db() 忘了重开外键，下面两条断言会红。
+        self.write_json([copy.deepcopy(GOOD)])
+        self.assertEqual(import_bank(self.json_path, self.db), 1)
+        conn = open_db(self.db)
+        self.addCleanup(conn.close)
+        conn.execute("INSERT INTO attempts VALUES ('e101','C',0,'2026-09-12')")
+        conn.execute("INSERT INTO wrong VALUES ('e101','C',1,'2026-09-12','2026-09-12',0)")
+        conn.execute("DELETE FROM questions WHERE id='e101'")
+        conn.commit()
+        self.assertEqual(conn.execute('SELECT COUNT(*) FROM attempts').fetchone()[0], 0)
+        self.assertEqual(conn.execute('SELECT COUNT(*) FROM wrong').fetchone()[0], 0)
+
+
+if __name__ == '__main__':
+    unittest.main()
