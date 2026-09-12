@@ -253,6 +253,53 @@ class TestAPI(ApiCase):
         self.assertTrue(hit['options'], 'options 没解成 JSON 数组')
         self.assertEqual(hit['chosen'], wrong)
 
+    # ---- 错题本：标记已订正 ----
+    def test_标记订正后错题不再出现(self):
+        """POST /api/wrong/<qid>/resolve 之后，这一题不再出现在 /api/wrong。
+
+        这是把 resolve 端点测死的唯一一条：端点没了（404）、SQL 没写、
+        或 UPDATE 少了 resolved=1，三种写法都在这里红。
+        """
+        q = self.get('/api/questions', limit=1)['questions'][0]
+        wrong = 'A' if q['answer'] != 'A' else 'B'
+        self.post('/api/attempts', {'qid': q['id'], 'chosen': wrong})
+        self.assertIn(q['id'], [x['id'] for x in self.get('/api/wrong')['questions']],
+                      '（前提）先做错一道，它得在错题本里')
+        code, payload = self.raw(f'/api/wrong/{q["id"]}/resolve', method='POST', body={})
+        self.assertEqual(code, 200, payload)
+        self.assertNotIn(q['id'], [x['id'] for x in self.get('/api/wrong')['questions']],
+                         '标记订正后这一题还在错题本里——UPDATE 没写进去？')
+        # 库里那行是「留着历史、不再算还没掌握」：resolved=1，不是被删掉。
+        # **只查这一题**——本类共用一份库，别的测试会往 wrong 里写行，
+        # 拿全表条数当标尺就是假设自己是干净的库（这类的老毛病）。
+        self.assertEqual(self.count_in_db(
+            'SELECT COUNT(*) FROM wrong WHERE qid=? AND resolved=1', (q['id'],)), 1)
+
+    def test_订正的怪路径返回404(self):
+        """这是 server.py 里第一条参数化路径（其余路由都是整串相等比对），
+        切错了就会 IndexError 冒出 Handler —— 那时客户端一个字节都收不到。
+
+        这里不光要 404，还要**路径本身被拒**：形状不对必须由切路径那一步拦下来，
+        写「not found」。只看状态码是测不动的——`/api/wrong//resolve` 切松了会漏到
+        查库那一步、撞上「题号不在库里」那条，照样是 404，红不了。
+        """
+        for path in ('/api/wrong//resolve', '/api/wrong/q1/extra/resolve',
+                     '/api/wrong/q1/resolve/', '/api/wrong/q1/foo',
+                     '/api/wrong/q1', '/api/wrong/'):
+            code, payload = self.raw(path, method='POST', body={})
+            self.assertEqual(code, 404, f'{path} → {code} {payload!r}')
+            self.assertEqual(json.loads(payload), {'error': 'not found'},
+                             f'{path} 不是被切路径那一步拒的（漏到查库了）：{payload!r}')
+
+    def test_订正题库里没有的题号返回404(self):
+        # qid 走 urlencode：HTTP 请求行只吃 ASCII，中文直接拼进去 urlopen 会抛
+        # UnicodeEncodeError（那是测试自己的错，不是服务端的）。服务端那边
+        # 对这一段做了 unquote，百分号编码的题号同样解得出来。
+        qid = urllib.parse.quote('这道题不存在')
+        code, payload = self.raw(f'/api/wrong/{qid}/resolve', method='POST', body={})
+        self.assertEqual(code, 404, payload)
+        self.assertIn('题库里没有这道题', json.loads(payload)['error'])
+
     # ---- 统计与清空（唯一会写库的两条路由 + 只被手工 curl 打过的 stats）----
     def test_统计与清空(self):
         # 本类共用一份库，别的测试也写作答记录——先清空把基线钉死。

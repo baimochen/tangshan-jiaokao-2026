@@ -224,6 +224,10 @@ function installFetchStub(opts) {
   opts = opts || {};
   const wrongCount = new Map();   // qid → 累计错次（banklib.record_attempt 的语义）
   const tried = new Set();        // qid → 已经有过作答行（迁移「只补不盖」的依据）
+  /* 错题本那三列（服务端是 wrong 表）：GET /api/wrong 与 POST /api/wrong/<qid>/resolve
+     都读它。语义照 banklib.record_attempt：做对了 resolved=1（行还在，只是不再算
+     「还没掌握」），又错了 wrong_count+1 且 resolved 翻回 0。 */
+  const wrongRows = new Map();    // qid → {chosen, wrong_count, resolved}
   const calls = [];               // 每一次请求：{path, method, body}
   const okJSON = obj => ({ ok: true, status: 200, statusText: 'OK', json: async () => obj });
   const errJSON = (status, error) => ({ ok: false, status, statusText: 'error', json: async () => ({ error }) });
@@ -231,13 +235,20 @@ function installFetchStub(opts) {
   /* override：让某一道题的 POST 直接回指定的响应体，不按本地规则算。
      用来断言「页面渲染的是响应体」——本地算法会判对的题，桩偏说错，
      页面若跟着判错，结论就只可能来自响应。用完置回 null。 */
-  const stub = { calls, wrongCount, override: null,
+  const stub = { calls, wrongCount, wrongRows, override: null,
                  /* 模考：配比表（GET 回的）、抽题用的配比、当前那一场、交卷的替身响应 */
                  mock: { plan: null, ratio: null, run: null, submitOverride: null },
                  /* 旧记录迁移：migrate 直接顶替响应体，migrateFail 让这一次失败 */
                  migrate: null, migrateFail: null };
   useMockPlan(stub, opts.ratio || PARTS);
   if (opts.run) stub.mock.run = opts.run;
+  /* 错题本的开局：先摆上几行（刷题页的错题由此而来）。同时喂 wrongCount——
+     迁移那段的「服务器上已经有这一题」看的是它，两份状态不能对不上。 */
+  (opts.wrong || []).forEach(w => {
+    wrongRows.set(w.qid, { chosen: w.chosen, wrong_count: w.wrong_count || 1,
+                           resolved: !!w.resolved });
+    wrongCount.set(w.qid, w.wrong_count || 1);
+  });
 
   global.fetch = async function (url, opts2) {
     const u = new URL(url, 'http://stub');
@@ -266,9 +277,49 @@ function installFetchStub(opts) {
                         explanation: o.explanation, wrong_count: o.wrong_count });
       }
       const correct = norm(b.chosen) === norm(item.answer);
-      if (!correct) wrongCount.set(b.qid, (wrongCount.get(b.qid) || 0) + 1);
+      if (correct) {
+        /* 做对了：错题本那行留着，只翻 resolved（与 banklib.record_attempt 同） */
+        const w = wrongRows.get(b.qid);
+        if (w) w.resolved = true;
+      } else {
+        wrongCount.set(b.qid, (wrongCount.get(b.qid) || 0) + 1);
+        const w = wrongRows.get(b.qid);
+        if (w) { w.chosen = b.chosen; w.wrong_count += 1; w.resolved = false; }
+        else wrongRows.set(b.qid, { chosen: b.chosen, wrong_count: 1, resolved: false });
+      }
       return okJSON({ correct, answer: item.answer, explanation: item.explanation,
                       wrong_count: wrongCount.get(b.qid) || 0 });
+    }
+
+    /* ---- 错题本页（任务 15）：GET /api/wrong 与 POST /api/wrong/<qid>/resolve ----
+       形状照 server.py：GET 回 {total, questions:[…题目字段 + chosen + wrong_count]}，
+       JOIN 的是 questions（题不在库里就整行不出）。resolve 只认
+       /api/wrong/<qid>/resolve 这一种形状，其余 404——和 server.py 那条路径解析
+       一一对应，桩和真实服务不会在这里分家。 */
+    if (u.pathname === '/api/wrong' && method === 'GET') {
+      const out = [];
+      for (const [qid, w] of wrongRows) {
+        if (w.resolved) continue;                  // WHERE w.resolved=0
+        const q = BANK.questions.find(x => x.id === qid);
+        if (!q) continue;                          // JOIN 不上就不出
+        out.push({ id: q.id, n: q.n, module: q.module, type: q.type, stem: q.stem,
+                   options: q.options, answer: q.answer, explanation: q.explanation,
+                   chosen: w.chosen, wrong_count: w.wrong_count });
+      }
+      return okJSON({ total: out.length, questions: out });
+    }
+    if (u.pathname.startsWith('/api/wrong/') && method === 'POST') {
+      const segs = u.pathname.slice('/api/wrong/'.length).split('/');
+      if (segs.length !== 2 || segs[1] !== 'resolve' || !segs[0]) {
+        return errJSON(404, 'not found');
+      }
+      const qid = decodeURIComponent(segs[0]);
+      if (!BANK.questions.some(x => x.id === qid)) {
+        return errJSON(404, '题库里没有这道题：' + qid);
+      }
+      const w = wrongRows.get(qid);
+      if (w) w.resolved = true;
+      return okJSON({ ok: true, qid, resolved: !!w });
     }
 
     /* ---- 模考：四个端点照 server.py 的契约答话 ---- */
@@ -450,6 +501,32 @@ async function bootHome(opts) {
                                       seedStore: opts.seedStore || null });
   S.fetch = installFetchStub();
   HOME_PAGE_SCRIPTS.forEach(rel => eval(readAsset(rel)));
+  return S;
+}
+
+/* ---------- 装配四：错题本页 ----------
+   与前几段同一套路：读页面自己的脚本集、按页面顺序 eval、等引擎取数回来。
+   本页**不引 bank.js**（脚本集由 test_split.py 钉死为 nav.js + wrong.js），
+   所以 wrong.js 自带取数封装，不依赖 window.api。 */
+const WRONG_HTML = fs.readFileSync(path.join(WEB, 'wrong.html'), 'utf8');
+const WRONG_WANT_SCRIPTS = ['assets/nav.js', 'assets/wrong.js'];
+const WRONG_PAGE_SCRIPTS = [...WRONG_HTML.split('</main>')[1]
+  .matchAll(/<script src="([^"]+)"><\/script>/g)].map(m => m[1]);
+if (WRONG_PAGE_SCRIPTS.join('|') !== WRONG_WANT_SCRIPTS.join('|')) {
+  console.error(`wrong.html 的脚本集变了：${WRONG_PAGE_SCRIPTS.join(' / ')}`
+    + `（错题本需要 ${WRONG_WANT_SCRIPTS.join(' / ')}）`);
+  process.exit(1);
+}
+
+async function bootWrong(opts) {
+  opts = opts || {};
+  const S = makeStub(WRONG_HTML, [], { idsFromHtml: true, readyState: 'loading',
+                                       seedStore: opts.seedStore || null });
+  S.fetch = installFetchStub({ wrong: opts.wrong || null });
+  eval(readAsset(WRONG_PAGE_SCRIPTS[0]));
+  window.NAV.forEach(n => { S.byId[n.id] = S.mkEl('section', { class: 'view' }); });
+  for (const rel of WRONG_PAGE_SCRIPTS.slice(1)) eval(readAsset(rel));
+  await wrongReady;
   return S;
 }
 
@@ -1631,10 +1708,211 @@ async function homeSection() {
   }
 }
 
+/* ---------- 错题本页（任务 15） ----------
+   真库 1000 题全是单选、也没有多选和判断（那两类只在合成题里有），所以
+   「你选 AC，正确 ABD」这条只能在合成题上盖——**别去真库里找多选题**，找不到是对的。
+   合成题临时插在 BANK 最前面（GET /api/wrong 的桩按 BANK 拼题目字段），
+   断言完 try/finally 摘掉，后面的装配吃的还得是原来那份题库。 */
+async function wrongSection() {
+  /* 事件是从 wrongRoot 上挂的那一个监听器派下去的；桩里没有真正的事件冒泡，
+     所以用例自己造 target，让 closest 只对「要找的那个选择器」回话。 */
+  const firesOn = (S, el, ev) => S.listeners.filter(l => l.el === el && l.t === 'click')
+                                            .forEach(l => l.fn(ev));
+  const listOf = S => S.byId.wrongRoot.innerHTML;
+  const cards = h => (h.match(/data-card="/g) || []).length;
+  const cardOf = (h, id) => h.split('<div class="qz').slice(1)
+                              .find(c => c.includes('data-card="' + id + '"')) || '';
+  /* 点了哪个选项 / 哪个按钮：桩里 closest 由用例自己给。 */
+  const clickOpt = (S, id, k) => firesOn(S, S.byId.wrongRoot, { target: { closest: sel => sel === '.opt'
+    ? { disabled: false, getAttribute: a => (a === 'data-wq' ? id : k) } : null } });
+  const clickOn = (S, attr, id) => firesOn(S, S.byId.wrongRoot, { target: { closest: sel => sel === '[' + attr + ']'
+    ? { disabled: false, getAttribute: a => (a === attr ? id : null) } : null } });
+
+  /* 九道同答案的合成单选 + 一道多选 + 一道判断。九道是给「解析原样」那条用的：
+     选项乱序是**每题随机**洗一次的，只有一道题时恰好洗成原序（1/24 的机会）会让
+     那条变成假绿；九道全洗成原序的概率 (1/24)^9，等于不会发生。 */
+  const mkS = i => ({ id: 'test-ws' + i, n: 9800 - i, module: '教育学', type: 'single',
+                      stem: '错题题干' + i,
+                      options: [{ key: 'A', text: '甲' }, { key: 'B', text: '乙' },
+                                { key: 'C', text: '丙' }, { key: 'D', text: '丁' }],
+                      answer: 'B', explanation: '故选 B。' });
+  const sqs = [0, 1, 2, 3, 4, 5, 6, 7, 8].map(mkS);
+  const mq = { id: 'test-wm0', n: 9900, module: '教育学', type: 'multi', stem: '错题本多选题干',
+               options: [{ key: 'A', text: '甲' }, { key: 'B', text: '乙' },
+                         { key: 'C', text: '丙' }, { key: 'D', text: '丁' }],
+               answer: 'ABD', explanation: '故选 A。' };
+  /* 判断题给 2 次（不是 1）：筛选门槛那条要有一道「恰好错 2 次」的题才测得动——
+     全是错 1 次和 3 次时，`>=2` 写成 `>=3` 结果一样，那条断言就成了摆设。 */
+  const jq = { id: 'test-wj0', n: 9901, module: '公共基础 · 法律', type: 'judge', stem: '错题本判断题干',
+               options: [{ key: 'A', text: '正确' }, { key: 'B', text: '错误' }],
+               answer: 'A', explanation: '判断题解析' };
+  /* 服务端那份错题的顺序（server.py 是 last_at 倒序）。判断先、多选后、再单选题：
+     模块是连着的两块，好让「按模块分组」有一个确定的期望；顺序**就是**服务端
+     回来的顺序，页面不另排（下面那条断言盯着这件事）。 */
+  const SEED = [{ qid: jq.id, chosen: 'B', wrong_count: 2 },
+                { qid: mq.id, chosen: 'AC', wrong_count: 2 }]
+    .concat(sqs.map((q, i) => ({ qid: q.id, chosen: 'A', wrong_count: i % 2 ? 3 : 1 })));
+  const n0 = BANK.questions.length;
+  const ADDED = 2 + sqs.length;
+  BANK.questions.unshift(mq, jq, ...sqs);
+  const IN = { mq, jq, sqs };
+
+  console.log('\n【错题本 · 渲染】');
+  {
+    const S = await bootWrong({ wrong: SEED });
+    const h = listOf(S);
+    const posts = p => S.fetch.calls.filter(c => c.path === p && c.method === 'POST');
+    /* 服务端那份错题是取回来的：一条都没发请求 / 请求打错端点，这里立刻红。 */
+    ok(S.fetch.calls.some(c => c.path === '/api/wrong' && c.method === 'GET'),
+       '错题本是开局问服务端要的（GET /api/wrong），不是页面自己带的');
+    ok(cards(h) === SEED.length,
+       `服务端回的 ${SEED.length} 道错题都渲染出来了（实际 ${cards(h)}）`);
+
+    /* **本任务的硬要求**：多选题要显示「你选 AC，正确 ABD」。 */
+    const cm = cardOf(h, mq.id);
+    ok(cm.includes('你选 AC，正确 ABD'),
+       `多选题显示「你选 AC，正确 ABD」（实际那一行：${(cm.match(/<p class="wmeta">([^<]*)</) || [])[1] || '无'}）`);
+    ok(cm.includes('错了 2 次'), '多选题标出错了几次');
+    /* 选项按原始顺序排、correct/wrong 各标在哪一项：
+       A 在答案里（correct）、C 选过但错了（wrong）、B/D 是答案（correct）。 */
+    const pairs = [...cm.matchAll(/class="opt ([^"]+)"[^>]*data-wk="([^"]+)"/g)]
+      .map(m => m[2] + ':' + m[1]).sort().join(',');
+    ok(pairs === 'A:correct,B:correct,C:wrong,D:correct',
+       `多选题的选项着色按答案与错选算（实际 ${pairs}）`);
+
+    /* 判断题：不标 A/B（和刷题页同一套），那一行改用选项文字。 */
+    const cj = cardOf(h, jq.id);
+    ok(!/<span class="k">/.test(cj), '判断题的按钮上没有 A/B 字母');
+    ok(cj.includes('你选 错误，应选 正确'),
+       `判断题显示「你选 错误，应选 正确」（实际：${(cj.match(/<p class="wmeta">([^<]*)</) || [])[1] || '无'}）`);
+
+    /* **不洗牌、不调 remapExplain**：选项顺序是原始的 A/B/C/D，解析逐字节原样。
+       只调 remapExplain 不洗牌（只做一半）时，它会现建一张乱序表把「故选 B」
+       里的字母换掉——这两条里至少有一条会红。 */
+    const badOrder = IN.sqs.filter(q => {
+      const c = cardOf(h, q.id);
+      const keys = [...c.matchAll(/data-wk="([^"]+)"/g)].map(m => m[1]).join('');
+      return keys !== 'ABCD';
+    });
+    ok(badOrder.length === 0,
+       badOrder.length ? `选项没按原始顺序排：${badOrder.map(q => q.id).join(',')}`
+                       : `${IN.sqs.length} 道单选题的选项都按原始顺序（A/B/C/D）排，没有洗牌`);
+    const badExp = IN.sqs.filter(q => cardOf(h, q.id).indexOf('故选 B。') < 0);
+    ok(badExp.length === 0,
+       badExp.length ? `解析被改了（remapExplain 被调过一次？）：${badExp.map(q => q.id).join(',')}`
+                     : `${IN.sqs.length} 道题的解析逐字节原样渲染（错题本不洗牌，也就没调 remapExplain）`);
+    const expM = (cm.match(/<div class="ans">([\s\S]*?)<\/div>/) || [])[1];
+    ok(expM === '故选 A。', `多选题的解析也原样渲染（实际「${expM}」）`);
+
+    /* 按模块分组：连着的一段同一个模块给一个标题。标题顺序、以及卡片顺序，
+       都跟着服务端回来的顺序走，页面不另排一遍（本地再排一次就是第二份真相，
+       而且「最近错的在最前面」这个排序只有服务端知道）。 */
+    const hs = [...h.matchAll(/<h3>([^<]+)<\/h3>/g)].map(m => m[1]);
+    ok(hs.join('|') === '公共基础 · 法律|教育学',
+       `按模块分组，标题跟着服务端的顺序（实际 ${hs.join(' / ')}）`);
+    const order = [...h.matchAll(/data-card="([^"]+)"/g)].map(m => m[1]);
+    ok(order.join(',') === SEED.map(w => w.qid).join(','),
+       '卡片顺序就是服务端回来的顺序（页面没有本地再排一次）');
+
+    /* 「标记已订正」：打的是 resolve 端点，打完之后这一题不再出现在列表里。
+       这是能把 resolve 那条路测死的唯一一条断言。 */
+    const p0 = posts('/api/wrong/test-wm0/resolve').length;
+    clickOn(S, 'data-resolve', mq.id); await settle();
+    ok(posts('/api/wrong/test-wm0/resolve').length === p0 + 1,
+       '点「标记已订正」打的是 POST /api/wrong/<qid>/resolve');
+    const h2 = listOf(S);
+    ok(cardOf(h2, mq.id) === '' && cards(h2) === SEED.length - 1,
+       `标记订正后这一题不再出现（${cards(h2)} 题，应为 ${SEED.length - 1}）`);
+    ok(S.fetch.wrongRows.get(mq.id).resolved === true, '库里那行是 resolved=1（留着历史，不是删掉）');
+    /* 别的题不受影响：把整个列表清空也满足上面那条，这条挡住它。 */
+    ok(cardOf(h2, jq.id) !== '' && cardOf(h2, sqs[0].id) !== '', '别的错题还留着（没有整页清空）');
+
+    /* 「重做这道题」：点选项 → POST /api/attempts（判分在服务端），做对了就消失。 */
+    const right = sqs[0];                       /* 答案是 B */
+    clickOpt(S, right.id, 'B'); await settle();
+    ok(posts('/api/attempts').some(c => c.body && c.body.qid === right.id && c.body.chosen === 'B'),
+       `点选项重做打的是 POST /api/attempts（${right.id} → B）`);
+    const h3 = listOf(S);
+    ok(cardOf(h3, right.id) === '', '做对了的题从错题本里消失（resolved=1）');
+    ok(cards(h3) === SEED.length - 2, `错题本少了这一道（${cards(h3)} 题）`);
+
+    /* 又答错：题留着，错次 +1，而且在那一行里读得出来。 */
+    const still = sqs[1];                       /* 答案是 B，序号 1 → 错次 3 */
+    clickOpt(S, still.id, 'A'); await settle();
+    const h4 = listOf(S);
+    ok(cardOf(h4, still.id) !== '', '又答错的题留在错题本里');
+    ok(cardOf(h4, still.id).includes('错了 4 次'),
+       `又错一次错次 +1（实际那一行：${(cardOf(h4, still.id).match(/<p class="wmeta">([^<]*)</) || [])[1] || '无'}）`);
+
+    /* 「只显示错 2 次以上」：勾上只剩错次 >= 2 的题，取消就回来。
+       期望值从**筛选题本身的定义**（还没订正、错次 >= 2）现算，不照着实现那行
+       抄——门槛被改成 >=3 时两边才会分家（fixture 里因此特意留了一道恰好错 2 次的判断）。 */
+    const want2 = S.fetch.wrongRows;
+    const live2 = qid => want2.get(qid);
+    const expect2 = SEED.filter(w => !live2(w.qid).resolved
+                                     && live2(w.qid).wrong_count >= 2).length;
+    firesOn(S, S.byId.wrongRoot, { target: { closest: sel => sel === '[data-wonly2]'
+      ? { checked: true } : null } });
+    const h5 = listOf(S);
+    ok(cards(h5) === expect2, `「只显示错 2 次以上」只剩 ${cards(h5)} 题（应为 ${expect2}）`);
+    ok(IN.sqs.every(q => !(want2.get(q.id).wrong_count < 2 && cardOf(h5, q.id) !== '')),
+       '错 1 次的题都被筛掉了');
+    firesOn(S, S.byId.wrongRoot, { target: { closest: sel => sel === '[data-wonly2]'
+      ? { checked: false } : null } });
+    ok(cards(listOf(S)) === cards(h4), '取消勾选后回到全部');
+  }
+
+  console.log('\n【错题本 · 多选题重做】');
+  {
+    /* 多选题的重做和刷题页同一套：点选项只切换勾选，「确认作答」才交。
+       要按服务端的判分（少选算错）走——所以勾 AC（答案是 ABD）该判错。 */
+    const S = await bootWrong({ wrong: [{ qid: mq.id, chosen: 'AC', wrong_count: 2 }] });
+    const posts = () => S.fetch.calls.filter(c => c.path === '/api/attempts' && c.method === 'POST');
+    const p0 = posts().length;
+    clickOpt(S, mq.id, 'A'); await settle();
+    ok(posts().length === p0, '多选题点选项只切换勾选，不提交');
+    ok(listOf(S).includes('data-wconfirm="' + mq.id + '"'), '勾上之后才出现「确认作答」');
+    clickOpt(S, mq.id, 'A'); await settle();
+    ok(!listOf(S).includes('data-wconfirm="' + mq.id + '"'),
+       '再点一下取消勾选；一项都没勾时不建「确认作答」（空勾选交出去会被判成一次错答）');
+    ['A', 'C'].forEach(k => clickOpt(S, mq.id, k));
+    await settle();
+    const hint = listOf(S);
+    ok([...cardOf(hint, mq.id).matchAll(/class="opt[^"]*picked"[^>]*data-wk="([^"]+)"/g)]
+         .map(m => m[1]).sort().join('') === 'AC',
+       '勾选态画在卡上（A、C 标成 picked）');
+    clickOn(S, 'data-wconfirm', mq.id); await settle();
+    const sent = posts();
+    ok(sent.length === p0 + 1, '点「确认作答」才发请求');
+    ok(sent.length && sent[sent.length - 1].body.chosen === 'AC',
+       `交上去的是勾选的字母串（实际 ${sent.length ? sent[sent.length - 1].body.chosen : '—'}）`);
+    const c = cardOf(listOf(S), mq.id);
+    ok(c !== '' && c.includes('错了 3 次'),
+       `少选算错：题留着、错次 +1（实际那一行：${(c.match(/<p class="wmeta">([^<]*)</) || [])[1] || '无'}）`);
+  }
+
+  console.log('\n【错题本 · 空本与取数失败】');
+  {
+    const E = await bootWrong({});
+    ok(/错题本是空的/.test(listOf(E)) && cards(listOf(E)) === 0, '错题本为空时给一句提示，不渲染卡片');
+    /* 坏记录（chosen 是 NULL：旧记录只记了错、没记选的是什么）不能把整页带崩。 */
+    const B = await bootWrong({ wrong: [{ qid: sqs[0].id, chosen: null, wrong_count: 1 }] });
+    ok(cards(listOf(B)) === 1 && /你选 —，正确 B/.test(listOf(B)),
+       `chosen 是 NULL 的老记录照常渲染（实际那一行：${(cardOf(listOf(B), sqs[0].id).match(/<p class="wmeta">([^<]*)</) || [])[1] || '无'}）`);
+  }
+
+  /* 摘干净：合成题是 unshift 进去的，所以从**头上**切掉；后面的装配吃的还得是
+     原来那份题库。切错了（比如设 length 去尾）这里立刻红。 */
+  BANK.questions.splice(0, ADDED);
+  ok(BANK.questions.length === n0 && !BANK.questions.some(q => q.id === mq.id),
+     `合成题已从题库里摘掉（还是 ${BANK.questions.length} 题）`);
+}
+
 (async function () {
   await quizSection();
   await mockSection();
   await homeSection();
+  await wrongSection();
   console.log(failed ? `\n❌ ${failed} 项未通过` : '\n✅ 全部通过');
   process.exit(failed ? 1 : 0);
 })();

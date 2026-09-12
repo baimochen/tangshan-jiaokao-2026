@@ -509,6 +509,42 @@ def make_handler(db_path, web_dir=WEB):
                                        'existing': existing})
                 finally:
                     conn.close()
+
+            # POST /api/wrong/<qid>/resolve —— 错题本上的「标记已订正」。
+            # **这是本文件第一条参数化路由**：其余全是 u.path == '…' 的整串比对，
+            # 所以路径要自己切，而且切错不能把 IndexError 冒到 Handler 外面
+            # （冒出去客户端一个字节都收不到）。切法写死成「/api/wrong/ 之后正好
+            # 一段 qid + 一段 resolve」：
+            #     /api/wrong/q1/resolve      → 订正
+            #     /api/wrong//resolve        → 404（qid 是空串）
+            #     /api/wrong/q1/resolve/     → 404（末尾多一段空的）
+            #     /api/wrong/q1/extra/resolve→ 404（段数不对）
+            # 放在这里而不是更上面，是因为 /api/wrong 的精确比对与 DELETE /api/wrong
+            # 都不以 '/api/wrong/' 开头，谁也不会遮住谁。
+            if u.path.startswith('/api/wrong/'):
+                segs = u.path[len('/api/wrong/'):].split('/')
+                if len(segs) != 2 or segs[1] != 'resolve' or not segs[0]:
+                    return self._send({'error': 'not found'}, 404)
+                qid = urllib.parse.unquote(segs[0])
+                conn = self._conn()
+                try:
+                    # 题号不在库里 → 404，形状同 :482 的 /api/attempts 那条
+                    # （banklib.record_attempt 抛的 KeyError 也翻成这句）。
+                    if conn.execute('SELECT 1 FROM questions WHERE id=?',
+                                    (qid,)).fetchone() is None:
+                        return self._send({'error': f'题库里没有这道题：{qid}'}, 404)
+                    now = _iso(int(time.time() * 1000))
+                    # 与 banklib.record_attempt 做对时那条 UPDATE 同一形状：
+                    # 行留着当历史，只把 resolved 翻成 1。last_at 一并更新——
+                    # 它记的是「这一题最后一次被处理的时间」。
+                    cur = conn.execute(
+                        'UPDATE wrong SET resolved=1, last_at=? WHERE qid=?', (now, qid))
+                    conn.commit()
+                    return self._send({'ok': True, 'qid': qid,
+                                       'resolved': bool(cur.rowcount)})
+                finally:
+                    conn.close()
+
             return self._send({'error': 'not found'}, 404)
 
         def do_DELETE(self):
