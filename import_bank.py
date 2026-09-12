@@ -57,8 +57,16 @@ def infer_type(q):
     return 'judge' if len(q.get('options') or []) == 2 else 'single'
 
 
-def validate(questions):
-    """返回错误信息列表。空列表 = 全部通过。"""
+def validate(questions, batch=1):
+    """返回错误信息列表。空列表 = 全部通过。
+
+    batch 决定「本地题/校情题必须附来源」这条规则要不要管：
+    第 1 批是建库前就有的存量数据，写的时候还没有 source 这个字段，
+    追溯补齐等于重查重挂——所以只对 batch >= 2 的新题强制。
+
+    注意：batch 这里是个粗略的上下界判断，不是逐题精确到它属于哪一批。
+    调用方传进来的整批共用一个 batch，够用。
+    """
     errs = []
     seen_id, seen_n = set(), set()
     for q in questions:
@@ -116,7 +124,9 @@ def validate(questions):
                     errs.append(
                         f'{where} 解析写「{m.group(0).strip()}」但答案是 {ans}')
 
-        if mod in NEEDS_SOURCE and not (q.get('source') or '').strip():
+        # 来源必填只对新批次生效：batch 1 是存量数据，没有 source 字段
+        if (mod in NEEDS_SOURCE and batch >= 2
+                and not (q.get('source') or '').strip()):
             errs.append(f'{where} 「{mod}」的题必须附来源 source')
 
     return errs
@@ -130,7 +140,7 @@ def import_bank(json_path, db_path=DB, batch=1, replace=True):
     for q in questions:
         q.setdefault('type', infer_type(q))
 
-    errs = validate(questions)
+    errs = validate(questions, batch=batch)
     if errs:
         print(f'校验未通过，共 {len(errs)} 条，未写入任何数据：', file=sys.stderr)
         for e in errs[:30]:

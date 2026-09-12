@@ -65,10 +65,18 @@ class TestValidate(unittest.TestCase):
         errs = validate(bad(explanation='   '))
         self.assertTrue(any('解析为空' in e for e in errs), errs)
 
-    def test_拒绝本地题没有来源(self):
+    def test_本地题没有来源_新批次拒绝(self):
         q = copy.deepcopy(GOOD)
         q['module'] = '唐山本地政策与时政'
-        self.assertTrue(any('来源' in e for e in validate([q])))
+        errs = validate([q], batch=2)
+        self.assertTrue(any('来源' in e for e in errs), errs)
+
+    def test_本地题没有来源_第1批放行(self):
+        # batch 1 是建库前的存量数据，当时还没有 source 字段，追溯补齐=重查重挂。
+        # 这条和上一条必须都在：只留一边的话，规则被悄悄反转也测不出来。
+        q = copy.deepcopy(GOOD)
+        q['module'] = '唐山本地政策与时政'
+        self.assertEqual(validate([q], batch=1), [])
 
     def test_拒绝解析与答案不自洽(self):
         # 解析写「故选 C」，答案却是 B
@@ -104,6 +112,15 @@ class TestImportBank(unittest.TestCase):
         self.addCleanup(conn.close)
         row = conn.execute('SELECT id,section,type,batch FROM questions').fetchone()
         self.assertEqual(row, ('e101', 'edu', 'single', 1))
+
+    def test_batch_透传给校验规则(self):
+        # 同一道没来源的本地题：batch=2 被拒（返回 0），batch=1 放行（返回 1）。
+        # 钉住 import_bank 确实把 batch 交给了 validate。
+        q = copy.deepcopy(GOOD)
+        q['module'] = '唐山本地政策与时政'
+        self.write_json([copy.deepcopy(q)])
+        self.assertEqual(import_bank(self.json_path, self.db, batch=2), 0)
+        self.assertEqual(import_bank(self.json_path, self.db, batch=1), 1)
 
     def test_坏题库一题都不写(self):
         # 先入库一题好数据，再用坏数据覆盖导入：校验不过就该整批不写，
