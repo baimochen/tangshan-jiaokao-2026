@@ -1,0 +1,16 @@
+# 扫描版商业出版物（超格讲义）。本地自用，不传。
+*.pdf
+26年河北教育理论基础笔记*
+
+# B 站 cookie jar：含本机设备标识，且对别人无用。
+# 需要跑 tools/video/pick.py 时自己重新生成一份即可。
+tools/video/bili.jar
+
+# macOS
+.DS_Store
+._*
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
