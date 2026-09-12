@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 
@@ -35,6 +36,17 @@ class TestValidate(unittest.TestCase):
         errs = validate([copy.deepcopy(GOOD), copy.deepcopy(GOOD)])
         # 第二条 n 也得改，否则先撞 n 唯一——这里显式只关心 id
         self.assertTrue(any('重复' in e and 'id' in e for e in errs), errs)
+
+    def test_拒绝重复n(self):
+        # 两条 id 不同、n 相同：此时除了 n 重复，没有任何别的规则会被触发，
+        # 所以这条断言确实单独钉住了规则 2。
+        # （test_拒绝重复id 用两份相同 GOOD，第二条同时撞 id 和 n，且断言只看 id，
+        #   n 规则因此从来没被单独测过。）
+        a, b = copy.deepcopy(GOOD), copy.deepcopy(GOOD)
+        b['id'] = 'e102'
+        errs = validate([a, b])
+        self.assertTrue(any('n' in e and '重复' in e for e in errs), errs)
+        self.assertEqual(len(errs), 1, f'只该有 n 重复一条，实际 {errs}')
 
     def test_拒绝未知模块(self):
         errs = validate(bad(module='不存在的模块'))
@@ -113,6 +125,19 @@ class TestImportBank(unittest.TestCase):
         row = conn.execute('SELECT id,section,type,batch FROM questions').fetchone()
         self.assertEqual(row, ('e101', 'edu', 'single', 1))
 
+    def test_无type字段的两选项题存成judge(self):
+        # 真实 题库.json 的 1000 道题全都没有 type 字段，每行的 type 都靠
+        # infer_type 推断。若它静默返回 'single'，这条必须变红。
+        q = {'id': 'j1', 'n': 9, 'module': '教育学', 'stem': '判断题干',
+             'options': [{'key': 'A', 'text': '正确'}, {'key': 'B', 'text': '错误'}],
+             'answer': 'A', 'explanation': '解析'}
+        self.write_json([q])
+        self.assertEqual(import_bank(self.json_path, self.db), 1)
+        conn = open_db(self.db)
+        self.addCleanup(conn.close)
+        row = conn.execute("SELECT type FROM questions WHERE id='j1'").fetchone()
+        self.assertEqual(row, ('judge',))
+
     def test_batch_透传给校验规则(self):
         # 同一道没来源的本地题：batch=2 被拒（返回 0），batch=1 放行（返回 1）。
         # 钉住 import_bank 确实把 batch 交给了 validate。
@@ -132,6 +157,50 @@ class TestImportBank(unittest.TestCase):
         conn = open_db(self.db)
         self.addCleanup(conn.close)
         self.assertEqual(conn.execute('SELECT COUNT(*) FROM questions').fetchone()[0], 1)
+
+    def _写一好一坏两题(self):
+        # 好题先 INSERT 成功，坏题再撞 questions.stem 的 NOT NULL。
+        # stem=None 过得了 validate（validate 不查 stem），挡它的只有 DB 约束。
+        good = copy.deepcopy(GOOD)
+        badq = copy.deepcopy(GOOD)
+        badq['id'], badq['n'], badq['stem'] = 'e102', 2, None
+        self.write_json([good, badq])
+
+    def _spy抓获内部连接(self):
+        # 把 import_bank 内部 open_db() 开的那条连接抓出来，返回 captured 列表。
+        # import_bank() 里 open_db 是模块级名字查找，改模块属性即可生效。
+        import import_bank as ib
+        captured, real_open_db = [], ib.open_db
+
+        def spy(path):
+            c = real_open_db(path)
+            captured.append(c)
+            return c
+
+        ib.open_db = spy
+        self.addCleanup(setattr, ib, 'open_db', real_open_db)
+        return captured
+
+    def test_写入中途抛异常也关连接(self):
+        # 异常路径必须关连接：关过的连接再 execute 会报「已关闭」。
+        # 没有 try/finally 时这条会红（连接还开着，execute 成功）。
+        self._写一好一坏两题()
+        captured = self._spy抓获内部连接()
+        with self.assertRaises(sqlite3.IntegrityError):
+            import_bank(self.json_path, self.db)
+        self.assertEqual(len(captured), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            captured[0].execute('SELECT 1')
+
+    def test_写入中途抛异常不留未提交事务(self):
+        # 连接一关，未提交的事务就回滚，磁盘上的回滚日志不该留下。
+        # 没有 try/finally 时事务还挂着，bank.db-journal 还在，这条会红。
+        self._写一好一坏两题()
+        self._spy抓获内部连接()
+        with self.assertRaises(sqlite3.IntegrityError):
+            import_bank(self.json_path, self.db)
+        self.assertFalse(os.path.exists(self.db + '-journal'),
+                         '连接没关：未提交的事务还挂着，回滚日志还在')
 
     def test_新连接上删题连带删除作答与错题(self):
         # 真实使用路径：open_db() 是全新连接，从没跑过 schema.sql。

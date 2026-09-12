@@ -37,8 +37,6 @@ SECTION_OF = {
 # 必须附来源的模块：内容是联网核实来的
 NEEDS_SOURCE = {'唐山工业职业技术大学校情', '唐山本地政策与时政'}
 
-LETTERS = 'ABCDE'
-
 
 def open_db(db_path):
     """开一条连接并把外键开关重新打开。
@@ -137,6 +135,8 @@ def import_bank(json_path, db_path=DB, batch=1, replace=True):
         data = json.load(f)
     questions = data['questions'] if isinstance(data, dict) else data
 
+    # 注意：setdefault 会就地把 type 写回调用方传进来的 dict（别名同一批对象），
+    # 这里只有一个调用方（CLI），已判定无害。
     for q in questions:
         q.setdefault('type', infer_type(q))
 
@@ -150,22 +150,26 @@ def import_bank(json_path, db_path=DB, batch=1, replace=True):
         return 0
 
     conn = open_db(db_path)
-    with open(SCHEMA, encoding='utf-8') as f:
-        conn.executescript(f.read())
-    if replace:
-        conn.execute('DELETE FROM questions')
-    for q in questions:
-        conn.execute(
-            "INSERT INTO questions "
-            "(id,n,section,module,type,stem,options,answer,explanation,"
-            " source,tags,difficulty,batch) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (q['id'], q['n'], SECTION_OF[q['module']], q['module'], q['type'],
-             q['stem'], json.dumps(q['options'], ensure_ascii=False), q['answer'],
-             q['explanation'], q.get('source'), q.get('tags'),
-             q.get('difficulty'), batch))
-    conn.commit()
-    conn.close()
+    try:
+        with open(SCHEMA, encoding='utf-8') as f:
+            conn.executescript(f.read())
+        if replace:
+            conn.execute('DELETE FROM questions')
+        for q in questions:
+            conn.execute(
+                "INSERT INTO questions "
+                "(id,n,section,module,type,stem,options,answer,explanation,"
+                " source,tags,difficulty,batch) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (q['id'], q['n'], SECTION_OF[q['module']], q['module'], q['type'],
+                 q['stem'], json.dumps(q['options'], ensure_ascii=False), q['answer'],
+                 q['explanation'], q.get('source'), q.get('tags'),
+                 q.get('difficulty'), batch))
+        conn.commit()
+    finally:
+        # INSERT 中途抛异常也要关连接：否则句柄泄漏，未提交的事务还挂着。
+        # close() 不 commit，未提交的写入会被回滚，所以「一题都不写」的性质不变。
+        conn.close()
     return len(questions)
 
 
