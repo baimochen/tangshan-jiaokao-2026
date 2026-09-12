@@ -43,66 +43,88 @@ THEME_BTN_CSS = """
 }
 """
 
+NAV_PLACEHOLDER = '__NAV__'
 NAV_JS = """// 导航注入 + 主题切换。每个页面只需 <script src="assets/nav.js"></script>。
+// 放哪儿都行：<head> 里（不必加 defer）或 </body> 之前，两种都能挂上。
+//
 // 本文件由 tools/extract_assets.py 生成过一次，之后直接改这里。
 //
 // 自包含：NAV 就写在本文件里，不拆成 nav-data.js。
 // 拆开的话页面要多一个 <script> 标签、还得保证加载顺序；
 // 更要命的是 nav-data.js 一旦 404，NAV.map 直接抛异常，
 // 整个导航会从页面上无声消失——只有控制台里留一行报错。
-window.NAV = {nav_items};
+(function () {
+  window.NAV = __NAV__;
 
-// 把导航插到 <body> 最前面，并按 body[data-page] 高亮当前页。
-function mountNav() {{
-  const here = document.body.dataset.page || '';
-  const nav = document.createElement('nav');
-  nav.className = 'nav';
-  nav.setAttribute('aria-label', '分类导航');
-  nav.innerHTML =
-    '<div class="nav-inner">' +
-    // 品牌文字沿用源页面的「教育类考点体系」；现在是个链接，指向新的总览页。
-    '<a class="nav-brand" href="index.html">教育类考点体系</a>' +
-    '<ul class="nav-list">' +
-    window.NAV.map(function (n) {{
-      // 走 n.href，不走「id 拼 .html」——index 的 id 和文件名对不上，
-      // 拼接式会在这一项上悄悄指错地方。
-      return '<li><a href="' + n.href + '"' +
-             (n.id === here ? ' class="active"' : '') + '>' + n.label + '</a></li>';
-    }}).join('') +
-    '</ul>' +
-    '<button class="theme-btn" id="themeBtn" type="button" aria-label="切换主题">◐</button>' +
-    '</div>';
-  document.body.insertBefore(nav, document.body.firstChild);
-}}
+  // 把导航插到 <body> 最前面，并按 body[data-page] 高亮当前页。
+  function mountNav() {
+    const here = document.body.dataset.page || '';
+    const nav = document.createElement('nav');
+    nav.className = 'nav';
+    nav.setAttribute('aria-label', '分类导航');
+    nav.innerHTML =
+      '<div class="nav-inner">' +
+      // 品牌文字沿用源页面的「教育类考点体系」；现在是个链接，指向新的总览页。
+      '<a class="nav-brand" href="index.html">教育类考点体系</a>' +
+      '<ul class="nav-list">' +
+      window.NAV.map(function (n) {
+        // 走 n.href，不走「id 拼 .html」——index 的 id 和文件名对不上，
+        // 拼接式会在这一项上悄悄指错地方。
+        return '<li><a href="' + n.href + '"' +
+               (n.id === here ? ' class="active"' : '') + '>' + n.label + '</a></li>';
+      }).join('') +
+      '</ul>' +
+      '<button class="theme-btn" id="themeBtn" type="button" aria-label="切换主题">◐</button>' +
+      '</div>';
+    document.body.insertBefore(nav, document.body.firstChild);
+  }
 
-// 三态主题：跟随系统 → 亮 → 暗。
-// 只有碰到 localStorage 的两步裹 try：隐私模式/禁用存储的浏览器上它们会直接抛。
-// 不裹 → 异常冒出去整段挂掉；裹得太大（把挂监听也圈进去）→ 按钮成了死键。
-// 所以：读失败就当没存过，写失败就只改内存里的主题——两种情况下按钮都还能用，
-// 因为改 data-theme 本身是纯 DOM 操作，不依赖存储。
-function mountTheme() {{
-  const KEY = 'jiaokao-theme';
-  const setTheme = function (v) {{
-    if (v) {{ document.documentElement.dataset.theme = v; }}   // 先改 DOM，再谈落盘
-    else {{ delete document.documentElement.dataset.theme; }}
-    try {{
-      if (v) localStorage.setItem(KEY, v); else localStorage.removeItem(KEY);
-    }} catch (e) {{ /* localStorage 不可用时静默降级：主题能切，只是记不住 */ }}
-  }};
-  try {{
-    const saved = localStorage.getItem(KEY);
-    if (saved) document.documentElement.dataset.theme = saved;
-  }} catch (e) {{ /* 读不到就当没存过 */ }}
-  document.getElementById('themeBtn').addEventListener('click', function () {{
-    const cur = document.documentElement.dataset.theme;
-    const next = cur === 'dark' ? 'light' : cur === 'light' ? '' : 'dark';
-    setTheme(next);
-  }});
-}}
+  // 三态主题，实际循环是：跟随系统 → 暗 → 亮 → 跟随系统（跟随系统即删掉 data-theme）。
+  // 注意：系统本来就是暗色偏好时，第一次点击把 data-theme 设成 "dark"，
+  // 但页面此前渲染的就是暗色——所以那一下看起来没反应，要到第二次点才有变化。
+  //
+  // 只有碰到 localStorage 的两步裹 try：隐私模式/禁用存储的浏览器上它们会直接抛。
+  // 不裹 → 异常冒出去整段挂掉；裹得太大（把挂监听也圈进去）→ 按钮成了死键。
+  // 所以：读失败就当没存过，写失败就只改内存里的主题——两种情况下按钮都还能用，
+  // 因为改 data-theme 本身是纯 DOM 操作，不依赖存储。
+  function mountTheme() {
+    const KEY = 'jiaokao-theme';
+    const setTheme = function (v) {
+      if (v) { document.documentElement.dataset.theme = v; }   // 先改 DOM，再谈落盘
+      else { delete document.documentElement.dataset.theme; }
+      try {
+        if (v) localStorage.setItem(KEY, v); else localStorage.removeItem(KEY);
+      } catch (e) { /* localStorage 不可用时静默降级：主题能切，只是记不住 */ }
+    };
+    try {
+      const saved = localStorage.getItem(KEY);
+      if (saved) document.documentElement.dataset.theme = saved;
+    } catch (e) { /* 读不到就当没存过 */ }
+    document.getElementById('themeBtn').addEventListener('click', function () {
+      const cur = document.documentElement.dataset.theme;
+      const next = cur === 'dark' ? 'light' : cur === 'light' ? '' : 'dark';
+      setTheme(next);
+    });
+  }
 
-window.mountNav = mountNav;
-mountNav();
-mountTheme();
+  // mountNav 碰 document.body，所以必须等 <body> 存在再跑。
+  // 把 <script> 放进 <head>（这是最容易犯的错，而下一步要拿一个模板批量生成
+  // 15 个页面——错一次就复制 15 份）时，此刻 document.body 还是 null，
+  // mountNav 会抛，导航整个从页面上消失。与其在注释里写「别忘了放 </body> 前」，
+  // 不如让这个失败模式压根不存在。
+  function mount() {
+    mountNav();
+    mountTheme();
+  }
+
+  window.mountNav = mountNav;
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', mount, { once: true });
+  } else {
+    mount();   // 已经在 </body> 前跑（readyState 已是 interactive/complete），直接挂
+  }
+})();
 """
 
 
@@ -136,21 +158,26 @@ def extract_nav(html):
     if not block:
         raise SystemExit('❌ 源文件里没有 <nav>…</nav> 块')
 
-    items = []
-    seen = set()
-    for m in re.finditer(r'<a href="#([\w-]+)"[^>]*>([^<]+)</a>', block.group(0)):
-        if m.group(1) in seen:
-            continue
-        seen.add(m.group(1))
-        items.append({'id': m.group(1), 'label': m.group(2), 'href': m.group(1) + '.html'})
+    raw = re.findall(r'<a href="#([\w-]+)"[^>]*>([^<]+)</a>', block.group(0))
 
-    if len(items) != EXPECT_ITEMS:
-        got = ', '.join(i['id'] for i in items) or '（一个都没有）'
+    # 先数原始匹配数，再去重。顺序反过来的话，源里多一个重复锚点会被去重悄悄吃掉，
+    # 计数照样等于 14，护栏睁眼瞎——而它的全部价值就是「结构变了就喊」。
+    if len(raw) != EXPECT_ITEMS:
+        got = ', '.join(i for i, _ in raw) or '（一个都没有）'
         raise SystemExit(
-            f'❌ <nav> 里应有 {EXPECT_ITEMS} 个锚点，实际 {len(items)} 个：{got}\n'
+            f'❌ <nav> 里应有 {EXPECT_ITEMS} 个锚点，实际 {len(raw)} 个：{got}\n'
             f'   源文件结构变了，先人工确认再改 EXPECT_ITEMS。'
         )
-    return items
+
+    ids = [i for i, _ in raw]
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        raise SystemExit(
+            f'❌ <nav> 里有重复的锚点 id：{", ".join(dupes)}\n'
+            f'   每个页面锚点只能出现一次，重复说明源文件结构变了。'
+        )
+
+    return [{'id': i, 'label': l, 'href': i + '.html'} for i, l in raw]
 
 
 def build_nav(items):
@@ -176,7 +203,10 @@ def main():
     css = extract_css(html)
     items = extract_nav(html)
     nav = build_nav(items)
-    js = NAV_JS.format(nav_items=json.dumps(nav, ensure_ascii=False, indent=2))
+    # 用占位符替换而不是 str.format：JS 里满是花括号，format 要求它们全部写成 {{}}，
+    # 模板一改就得跟着数括号，数错只会在运行时炸。占位符没有这个问题。
+    assert NAV_JS.count(NAV_PLACEHOLDER) == 1, '模板里的 __NAV__ 占位符必须恰好一个'
+    js = NAV_JS.replace(NAV_PLACEHOLDER, json.dumps(nav, ensure_ascii=False, indent=2))
 
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, 'app.css'), 'w', encoding='utf-8') as f:
