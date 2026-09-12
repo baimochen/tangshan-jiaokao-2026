@@ -2,19 +2,17 @@
    验证：脚本不抛错 → 首屏只渲染 40 题 → 点选项能作答 → 答错进错题本 →
         点「再显示」逐页追加 → 筛选「只看错题」只出错的题 → 模考抽题/判分/解析。
 
-   两套装配，各自 eval 自己那份脚本集，互不共用作用域：
-     · bootQuiz()       web/quiz.html + assets/{nav,bank,quiz}.js —— 刷题那 36 条
-     · bootMockLegacy() 考点体系.html 的内联脚本（原样整块 eval）—— 模考那 62 条
-   T10 把这一段整体换成 web/mock.html + assets/mock.js。
-
-   为什么必须分成两次装配：模考引擎这一轮还没搬出单体文件（那是 T10），而两份
-   脚本的 DOM 与 hidden 初值互相串不到一起（源页面里它们同页共存，靠的是同一个
-   作用域里的 var 提升）。混在一次 eval 里，谁改了谁的状态都看不出来。 */
+   两套装配，各自 eval 自己那份脚本集，互不共用作用域，**各自一个 fetch 桩**：
+     · bootQuiz()  web/quiz.html + assets/{nav,bank,quiz}.js
+     · bootMock()  web/mock.html + assets/{nav,bank,mock}.js
+   两个引擎都靠 fetch 桩顶替服务端（判分、抽题、交卷都在 server.py 那边，
+   桩只是照着同一份契约答话）。**桩必须是各自的实例**：共用一个的话，
+   一边记的请求会把另一边的断言带偏。 */
 
 /* 别在文件顶部加 'use strict'：这里靠**直接 eval** 把拆出来的 js 里的
-   var / function 声明带进 bootQuiz 的作用域（见 web/assets/quiz.js 的文件头）。
+   var / function 声明带进 bootQuiz / bootMock 的作用域（见 web/assets/quiz.js 的文件头）。
    严格模式下直接 eval 有自己的变量环境，那些声明一个都拿不到，
-   `await quizReady` 会直接 ReferenceError。 */
+   `await quizReady` / `await mockReady` 会直接 ReferenceError。 */
 
 const fs = require('fs');
 const path = require('path');
@@ -22,8 +20,7 @@ const path = require('path');
 const BASE = path.join(__dirname, '..');
 const WEB = path.join(BASE, 'web');
 const QUIZ_HTML = fs.readFileSync(path.join(WEB, 'quiz.html'), 'utf8');
-/* 单体文件只给模考装配读。 */
-const MONO_HTML = fs.readFileSync(path.join(BASE, '考点体系.html'), 'utf8');
+const MOCK_HTML = fs.readFileSync(path.join(WEB, 'mock.html'), 'utf8');
 
 /* ---------- 题库：测试自己那份 ----------
    引擎怎么取数由 fetch 桩决定（见 installFetchStub），这里这份只给断言用：
@@ -33,6 +30,83 @@ const MONO_HTML = fs.readFileSync(path.join(BASE, '考点体系.html'), 'utf8');
 const BANK = JSON.parse(fs.readFileSync(path.join(BASE, '题库.json'), 'utf8'));
 const bankById = {};
 BANK.questions.forEach(q => { bankById[q.id] = q; });
+
+/* ---------- 模考的配比依据：测试自己的一份 ----------
+   server.py 里的 MK_PARTS 只有一份，而且**刻意只有一份**：客户端不再存第二份，
+   页面渲染的配比表、成绩单分组全来自 GET /api/mock。这里是**测试独立抄的一份**：
+     ① 桩扮演服务端时按它造一场卷子（抽题是服务端的事，桩只是照着契约答话）；
+     ② 断言页面把服务端那份配比照原样渲染出来。
+   服务端的 MK_PARTS 改了，这份必须跟着改——不跟着改的话这几条断言会红，
+   红得对：两边对不上了。
+   抽题算法本身（模块配额、两部分不交错）由 tests/test_server.py 的 TestMock
+   直接打真服务验，这里不重复测桩。 */
+const MK_LOCAL = '地方特色 · 从公基匀出 · 不在大纲内';
+const PARTS = [
+  ['公共基础知识', [['公共基础 · 政治与时政', 16], ['公共基础 · 法律', 13],
+    ['公共基础 · 经济、管理与常识', 11], ['公共基础 · 公文写作', 8],
+    ['人文历史与科技常识', 6],
+    ['唐山工业职业技术大学校情', 3, MK_LOCAL], ['唐山本地政策与时政', 3, MK_LOCAL]]],
+  ['教育专业能力测验', [['教育学', 23], ['教育心理学', 17], ['教育法律法规', 7],
+    ['教师职业理念与职业道德', 6], ['职业教育与高等教育', 7]]],
+];
+const PLAN = PARTS.flatMap(P => P[1]);
+
+/* 服务端 GET /api/mock 会回的那份配比表（形状 = server.py 的 mock_plan()）。 */
+function planPayload(ratio) {
+  return ratio.map(([name, mods]) => ({
+    name,
+    n: mods.reduce((s, m) => s + m[1], 0),
+    modules: mods.map(m => m[2] ? { module: m[0], n: m[1], group: m[2] }
+                                : { module: m[0], n: m[1] }),
+  }));
+}
+/* 桩扮演服务端抽题（= server.py 的 mock_pick：模块内打乱 → 配额 → 部分内打乱 →
+   按部分接起来）。 */
+function pickRun(ratio) {
+  const ids = [], parts = [];
+  for (const [name, mods] of ratio) {
+    const out = [];
+    for (const [mod, quota] of mods) {
+      const have = BANK.questions.filter(q => q.module === mod).map(q => q.id);
+      for (let i = have.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1)); [have[i], have[j]] = [have[j], have[i]];
+      }
+      if (have.length < quota) throw new Error(`题库不足: ${mod} 需要 ${quota} 只有 ${have.length}`);
+      out.push(...have.slice(0, quota));
+    }
+    for (let i = out.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1)); [out[i], out[j]] = [out[j], out[i]];
+    }
+    parts.push({ name, n: out.length });
+    ids.push(...out);
+  }
+  return { ids, parts };
+}
+/* 桩扮演服务端判分（= server.py 的 mock_grade）。规则同 banklib.grade：
+   去重、排序、转大写、比集合（多选少选算错）。 */
+function gradeRun(run) {
+  const per = {}, wrong = []; let right = 0;
+  for (const id of run.ids) {
+    const q = bankById[id];
+    const r = per[q.module] = per[q.module] || { module: q.module, n: 0, right: 0 };
+    r.n++;
+    const a = run.answers[id];
+    if (!a) continue;
+    if (norm(a) === norm(q.answer)) { right++; r.right++; } else wrong.push(id);
+  }
+  const total = run.ids.length;
+  return { score: Math.round(right / total * 1000) / 10, right, total,
+           unanswered: total - Object.values(run.answers).filter(Boolean).length,
+           wrong, used: 0, submittedAt: run.submittedAt || Date.now(),
+           by_module: Object.values(per) };
+}
+/* 换一份配比：GET 回的配比表与抽题用的配比必须一起换（真实服务端里本来就是
+   同一份数据，分开设就是造一个现实中不存在的状态）。 */
+function useMockPlan(stub, ratio, seconds) {
+  stub.mock.ratio = ratio;
+  stub.mock.plan = { n: ratio.reduce((s, P) => s + P[1].reduce((t, m) => t + m[1], 0), 0),
+                     seconds: seconds || 7200, parts: planPayload(ratio) };
+}
 
 /* 装配之间共享这一份 localStorage，每次装配开头清空重灌。 */
 const store0 = {};
@@ -131,19 +205,22 @@ function makeStub(html, nav, opts) {
   return { byId, store, listeners, docListeners, fbtns, mkEl };
 }
 
-/* ---------- fetch 桩：顶替 server.py 的两个端点 ----------
+/* ---------- fetch 桩：顶替 server.py 的端点 ----------
    冒烟测试测的是引擎逻辑，不是 HTTP——HTTP 由 tests/test_server.py 覆盖。
-   只桩引擎真正用到的那两条路由（GET /api/questions、POST /api/attempts）：
-   多桩一条就多一处会和真实服务脱节的地方。
+   只桩引擎真正用到的那几条路由（刷题的两条 + 模考的四条）：多桩一条就多一处
+   会和真实服务脱节的地方。
    判分刻意走一遍和 banklib.grade 相同的规则（去重、排序、转大写、比集合），
-   好让「多选题少选算错」这类规则在客户端也成立。
+   好让「多选题少选算错」这类规则在客户端也成立；模考的抽题与判分同理，
+   照着 server.py 的 mock_pick / mock_grade 的样子答话。
 
-   桩会把**每一次请求**记进 `calls`，并留一个 `override` 口子（见下）。
-   这两个都不是为了「更真实」，是为了让「判分确实发生在服务端」有断言可依：
-   没有它们，把引擎改回本地按答案比，整套断言一条都不会红（任务 9 的 M4 突变）。 */
+   桩会把**每一次请求**记进 `calls`，并留几个 override 口子（见下）。
+   这些都不是为了「更真实」，是为了让「判分/抽题/交卷确实发生在服务端」有断言可依：
+   没有它们，把引擎改回本地按答案比、本地抽题，整套断言一条都不会红
+   （任务 9 的 M4 突变，以及任务 10 的 C80）。 */
 const norm = s => [...new Set((s || '').trim().toUpperCase())].sort().join('');
 
-function installFetchStub() {
+function installFetchStub(opts) {
+  opts = opts || {};
   const wrongCount = new Map();   // qid → 累计错次（banklib.record_attempt 的语义）
   const calls = [];               // 每一次请求：{path, method, body}
   const okJSON = obj => ({ ok: true, status: 200, statusText: 'OK', json: async () => obj });
@@ -152,13 +229,18 @@ function installFetchStub() {
   /* override：让某一道题的 POST 直接回指定的响应体，不按本地规则算。
      用来断言「页面渲染的是响应体」——本地算法会判对的题，桩偏说错，
      页面若跟着判错，结论就只可能来自响应。用完置回 null。 */
-  const stub = { calls, wrongCount, override: null };
+  const stub = { calls, wrongCount, override: null,
+                 /* 模考：配比表（GET 回的）、抽题用的配比、当前那一场、交卷的替身响应 */
+                 mock: { plan: null, ratio: null, run: null, submitOverride: null } };
+  useMockPlan(stub, opts.ratio || PARTS);
+  if (opts.run) stub.mock.run = opts.run;
 
-  global.fetch = async function (url, opts) {
+  global.fetch = async function (url, opts2) {
     const u = new URL(url, 'http://stub');
     const q = u.searchParams;
-    calls.push({ path: u.pathname, method: (opts && opts.method) || 'GET',
-                 body: opts && opts.body ? JSON.parse(opts.body) : null });
+    const method = (opts2 && opts2.method) || 'GET';
+    calls.push({ path: u.pathname, method,
+                 body: opts2 && opts2.body ? JSON.parse(opts2.body) : null });
     if (u.pathname === '/api/questions') {
       const mod = q.get('module'), sec = q.get('section'), typ = q.get('type');
       const list = BANK.questions.filter(x =>
@@ -167,8 +249,8 @@ function installFetchStub() {
       const lim = q.get('limit') === null ? 40 : +q.get('limit');   // server.py 的默认值就是 40
       return okJSON({ total: list.length, questions: list.slice(off, off + lim) });
     }
-    if (u.pathname === '/api/attempts' && opts && opts.method === 'POST') {
-      const b = JSON.parse(opts.body);
+    if (u.pathname === '/api/attempts' && method === 'POST') {
+      const b = JSON.parse(opts2.body);
       const item = BANK.questions.find(x => x.id === b.qid);
       // 库里没这道题：服务端是 404 + {'error':…}。桩里照同一个形状回，
       // 引擎才不会把「题不在库里」当成「记上了」。
@@ -183,9 +265,47 @@ function installFetchStub() {
       return okJSON({ correct, answer: item.answer, explanation: item.explanation,
                       wrong_count: wrongCount.get(b.qid) || 0 });
     }
+
+    /* ---- 模考：四个端点照 server.py 的契约答话 ---- */
+    if (u.pathname === '/api/mock') {
+      const run = stub.mock.run;
+      return okJSON({ n: stub.mock.plan.n, seconds: stub.mock.plan.seconds,
+                      parts: stub.mock.plan.parts,
+                      // 已交卷的那场：成绩一并带上（服务端是 GET 时现算的）
+                      run: run ? (run.submitted
+                        ? Object.assign({}, run, { result: gradeRun(run) }) : run) : null });
+    }
+    if (u.pathname === '/api/mock/start' && method === 'POST') {
+      const pick = pickRun(stub.mock.ratio);
+      const now = Date.now();
+      stub.mock.run = { ids: pick.ids, parts: pick.parts, answers: {}, i: 0,
+                        startedAt: now, endsAt: now + stub.mock.plan.seconds * 1000,
+                        submitted: false, submittedAt: 0 };
+      return okJSON(Object.assign({}, stub.mock.run));
+    }
+    if (u.pathname === '/api/mock/answer' && method === 'POST') {
+      const b = JSON.parse(opts2.body);
+      const run = stub.mock.run;
+      if (!run || run.submitted) return errJSON(404, '没有进行中的模考');
+      if (b.qid) {
+        if (!run.ids.includes(b.qid)) return errJSON(404, '这场模考里没有这道题：' + b.qid);
+        run.answers[b.qid] = b.chosen;
+      }
+      if (b.i !== undefined && b.i !== null) run.i = b.i;
+      return okJSON({ ok: true, answered: Object.values(run.answers).filter(Boolean).length });
+    }
+    if (u.pathname === '/api/mock/submit' && method === 'POST') {
+      const run = stub.mock.run;
+      if (!run) return errJSON(404, '没有进行中的模考');
+      if (stub.mock.submitOverride) return okJSON(stub.mock.submitOverride);
+      run.submitted = true;
+      const res = gradeRun(run);
+      run.submittedAt = res.submittedAt;
+      return okJSON(res);
+    }
     return errJSON(404, 'not found');
   };
-  return stub;   /* calls / override 交给 bootQuiz 转出去，给断言用 */
+  return stub;   /* calls / override 交给 bootQuiz / bootMock 转出去，给断言用 */
 }
 
 /* ---------- 装配一：拆页后的刷题页 ---------- */
@@ -227,37 +347,41 @@ async function bootQuiz() {
   return S;
 }
 
-/* ---------- 装配二：模考段（T10 前的过渡） ----------
-   这一段整体照旧跑 考点体系.html 的内联脚本：模考引擎还没搬出来，它和刷题引擎
-   在源文件里共用一个作用域，只能整块 eval。断言一条没动，仍有真实的对象可打。 */
-function bootMockLegacy(seedStore) {
-  const navLinks = [...MONO_HTML.matchAll(/<a href="#([\w-]+)"[^>]*>([^<]+)<\/a>/g)]
-    .filter(m => !['#qMore'].includes(m[1]));
-  const seen = new Set();
-  const nav = navLinks.filter(m => { if (seen.has(m[1])) return false; seen.add(m[1]); return true; })
-    .map(m => ({ id: m[1], label: m[2] }));
-  const bankJSON = MONO_HTML.match(/<script type="application\/json" id="qbank">([\s\S]*?)<\/script>/)[1];
-  const S = makeStub(MONO_HTML, nav, {
-    extraIds: ['qlist', 'qempty', 'qDone', 'qRate', 'wrongN', 'redoWrong', 'wrongReset', 'qTotal',
-      'qMod', 'progDone', 'progFill', 'progReset',
-      'mkSetup', 'mkExam', 'mkResult', 'mkClock', 'mkDone', 'mkPos', 'mkPrev', 'mkNext',
-      'mkCardBtn', 'mkCardPanel', 'mkSubmitBtn', 'mkQ', 'mkPlan', 'mkStart', 'mkResume',
-      'mkRev', 'mkReview', 'mkAgain', 'mkMore'],
-    qbankJson: bankJSON,
-    seedStore: seedStore,
-    /* mkMore / mkReview 这类是 innerHTML 里建出来的，真实 DOM 里那时才存在。 */
-    hiddenIds: ['mkSetup', 'mkExam', 'mkResult', 'mkCardPanel', 'mkResume', 'qempty'],
-  });
+/* ---------- 装配二：拆页后的模考页 ----------
+   与 bootQuiz 同一套路：读页面自己的脚本集、按页面顺序 eval、等引擎取数回来。
+   **这里必须自己装一个 fetch 桩**（不能借刷题那一段的）：两段各自一个桩实例，
+   请求记录才不会互相串。刷题段的桩是它自己的，模考段的也是。 */
+const MOCK_WANT_SCRIPTS = ['assets/nav.js', 'assets/bank.js', 'assets/mock.js'];
+const MOCK_PAGE_SCRIPTS = [...MOCK_HTML.split('</main>')[1].matchAll(/<script src="([^"]+)"><\/script>/g)]
+  .map(m => m[1]);
+if (MOCK_PAGE_SCRIPTS.join('|') !== MOCK_WANT_SCRIPTS.join('|')) {
+  console.error(`mock.html 的脚本集变了：${MOCK_PAGE_SCRIPTS.join(' / ')}`
+    + `（引擎需要 ${MOCK_WANT_SCRIPTS.join(' / ')}——bank.js 提供 api，必须在 mock.js 之前）`);
+  process.exit(1);
+}
 
-  /* 单体文件里唯一一处 <script>…</script>（不带 src）就是引擎那块。 */
-  const script = MONO_HTML.match(/<script>([\s\S]*?)<\/script>/)[1];
-  try {
-    eval(script);
-    if (!process.env.QUIET) console.log('脚本执行: ✅ 未抛错\n');
-  } catch (e) {
-    console.log('脚本执行: ❌ 抛出异常 →', e.message, '\n', e.stack.split('\n')[1]);
-    process.exit(1);
-  }
+async function bootMock(opts) {
+  opts = opts || {};
+  const nav = [];
+  const S = makeStub(MOCK_HTML, nav, {
+    idsFromHtml: true, readyState: 'loading',
+    /* mkRev / mkReview / mkAgain / mkMore 是 innerHTML 里建出来的，页面静态部分
+       没有它们，但真实 DOM 里那时已经存在（mk$ 找得到）。 */
+    extraIds: ['mkRev', 'mkReview', 'mkAgain', 'mkMore'],
+    seedStore: opts.seedStore || null,
+    hiddenIds: ['mkSetup', 'mkExam', 'mkResult', 'mkCardPanel', 'mkResume'],
+  });
+  /* 模考段自己的桩：ratio 换成别的就造一份别的卷子（见「配比照服务端那份渲染」那段），
+     run 喂一场指定的卷子（接着答 / 过期那两段）。 */
+  S.fetch = installFetchStub({ ratio: opts.ratio, run: opts.run });
+
+  eval(readAsset(MOCK_PAGE_SCRIPTS[0]));
+  window.NAV.forEach(n => { S.byId[n.id] = S.mkEl('section', { class: 'view' }); });
+  nav.push(...window.NAV.map(n => ({ id: n.id, label: n.label })));
+  for (const rel of MOCK_PAGE_SCRIPTS.slice(1)) eval(readAsset(rel));
+
+  /* 取数、以及「关着页面时过期」那条自动交卷都在里面，等它走完再断言。 */
+  await mockReady;
   return S;
 }
 
@@ -520,51 +644,71 @@ async function quizSection() {
   }
 }
 
-function mockSection() {
-const M = bootMockLegacy(null);
-const byId = M.byId, store = M.store, listeners = M.listeners, fbtns = M.fbtns, docListeners = M.docListeners;
-const fires = (el, ev) => listeners.filter(l => l.el === el && l.t === 'click').forEach(l => l.fn(ev));
+async function mockSection() {
+const M = await bootMock();
+const byId = M.byId, store = M.store, listeners = M.listeners, docListeners = M.docListeners;
+const calls = M.fetch.calls;
+const posts = p => calls.filter(c => c.path === p && c.method === 'POST');
+/* 每段装配各有各的桩、各存各的监听器：firesOn 指定点的是哪一段，fires 是「这一场（M）」
+   的简写。跨段点按钮若还按 M 的监听器找，一个都找不到。 */
+const firesOn = (S, el, ev) => S.listeners.filter(l => l.el === el && l.t === 'click').forEach(l => l.fn(ev));
+const fires = (el, ev) => firesOn(M, el, ev);
 /* 真实 DOM 里 innerHTML 一重写，旧元素连同它的监听器就没了。桩里元素是同一个，
    监听器会越堆越多，所以「重新建出来的按钮」只点最后一次绑上的那个。 */
 const fireLast = (el, ev) => {
   const ls = listeners.filter(l => l.el === el && l.t === 'click');
   if (ls.length) ls[ls.length - 1].fn(ev);
 };
+const pickOpt = k => fires(byId.mkQ, { target: { closest: sel => sel === '[data-mk]'
+  ? { getAttribute: a => (a === 'data-mk' ? k : null) } : null } });
+const runs = a => { let r = 0; for (let i = 1; i < a.length; i++) if (a[i] !== a[i - 1]) r++; return r; };
+const wrongOf = q => ['A', 'B', 'C', 'D'].find(k => k !== q.answer);
 
-/* ---------- 模考 ---------- */
+/* ---------- 配比表 ---------- */
 console.log('\n【模考 · 配比表】');
-const plan = byId.mkPlan.innerHTML;
-ok(/教育学/.test(plan) && /唐山本地政策与时政/.test(plan), '配比表列出全部模块');
-ok(/第[一二]部分 · 公共基础知识/.test(plan) && /第[一二]部分 · 教育专业能力测验/.test(plan),
-   '配比表按两部分分组');
-ok((plan.match(/60 题 · 50%/g) || []).length === 2, '每部分都标出「60 题 · 50%」');
-ok(plan.indexOf('公共基础知识') < plan.indexOf('教育专业能力测验'), '配比表里公基在前');
-ok(/合计/.test(plan) && /100%/.test(plan), '有合计行');
-/* 唐山本地政策 + 校情算在公基那 60 题里，但要单独标一组，不能混在公基四个模块里 */
-ok(/class="sub"><td colspan="3">地方特色/.test(plan), '唐山/校情在配比表里单独标组');
-ok(/class="sub"><td colspan="3">地方特色[\s\S]*?唐山工业职业技术大学校情[\s\S]*?唐山本地政策与时政/.test(plan),
-   '标组标题紧挨着这两行');
-ok(/人文历史与科技常识[\s\S]*?class="sub"/.test(plan),
-   '标组排在公基最后一个模块之后（没插在公基模块中间）');
-if (process.env.DUMP) console.log(byId.mkPlan.innerHTML.replace(/<tr/g, '\n<tr'));
+{
+  /* 配比表是服务端给的（GET /api/mock 的 parts）：页面里没有第二份配比。
+     下面这些断言盯的就是「渲染的是服务端那份」——页面自己写死一份的话，
+     「服务端说了算」那段会红。 */
+  const plan = byId.mkPlan.innerHTML;
+  ok(/教育学/.test(plan) && /唐山本地政策与时政/.test(plan), '配比表列出全部模块');
+  ok(/第[一二]部分 · 公共基础知识/.test(plan) && /第[一二]部分 · 教育专业能力测验/.test(plan),
+     '配比表按两部分分组');
+  ok((plan.match(/60 题 · 50%/g) || []).length === 2, '每部分都标出「60 题 · 50%」');
+  ok(plan.indexOf('公共基础知识') < plan.indexOf('教育专业能力测验'), '配比表里公基在前');
+  ok(/合计/.test(plan) && /100%/.test(plan), '有合计行');
+  /* 唐山本地政策 + 校情算在公基那 60 题里，但要单独标一组，不能混在公基四个模块里 */
+  ok(/class="sub"><td colspan="3">地方特色/.test(plan), '唐山/校情在配比表里单独标组');
+  ok(/class="sub"><td colspan="3">地方特色[\s\S]*?唐山工业职业技术大学校情[\s\S]*?唐山本地政策与时政/.test(plan),
+     '标组标题紧挨着这两行');
+  ok(/人文历史与科技常识[\s\S]*?class="sub"/.test(plan),
+     '标组排在公基最后一个模块之后（没插在公基模块中间）');
+  /* 逐模块对题量：少一个模块、题量写错都会红 */
+  const rows = [...plan.matchAll(/<tr><td>([^<]+)<\/td><td class="r">(\d+)<\/td>/g)].map(m => [m[1], +m[2]]);
+  const bad = PLAN.filter(([m, n]) => !rows.some(r => r[0] === m && r[1] === n));
+  ok(rows.length === PLAN.length && bad.length === 0,
+     bad.length ? `配比表里对不上：${bad.map(r => r[0]).join('; ')}`
+                : `${PLAN.length} 个模块的题量都照服务端那份配比列出`);
+  ok(calls.some(c => c.path === '/api/mock' && c.method === 'GET'),
+     '配比表是开局问服务端要的（GET /api/mock），不是页面自己带的');
+  if (process.env.DUMP) console.log(byId.mkPlan.innerHTML.replace(/<tr/g, '\n<tr'));
+}
 
+/* ---------- 抽题 ---------- */
 console.log('\n【模考 · 抽题】');
 fires(byId.mkStart, {});
+await settle();                       /* 抽题在服务端，是异步的 */
 ok(byId.mkExam.hidden === false, '点「开始考试」进入答题界面');
-const mock = JSON.parse(store['jiaokao-mock-2026'] || 'null');
-ok(mock && mock.ids && mock.ids.length === 120, `抽到 ${mock && mock.ids ? mock.ids.length : 0} 题（应为 120）`);
+ok(posts('/api/mock/start').length === 1,
+   `抽题打的是服务端（POST /api/mock/start 发了 ${posts('/api/mock/start').length} 次）`);
+const mock = M.fetch.mock.run;        /* 服务端那一场 */
+ok(mock && mock.ids && mock.ids.length === 120, `服务端抽出 ${mock && mock.ids ? mock.ids.length : 0} 题（应为 120）`);
 ok(new Set(mock.ids).size === 120, '120 题互不重复');
+const MAIN_IDS = mock.ids;
 
-/* 卷面分两部分：第一部分整块公基，第二部分整块教基，每块内部打乱 */
-const PARTS = [
-  ['公共基础知识', [['公共基础 · 政治与时政', 16], ['公共基础 · 法律', 13],
-    ['公共基础 · 经济、管理与常识', 11], ['公共基础 · 公文写作', 8],
-    ['人文历史与科技常识', 6],
-    ['唐山工业职业技术大学校情', 3], ['唐山本地政策与时政', 3]]],
-  ['教育专业能力测验', [['教育学', 23], ['教育心理学', 17], ['教育法律法规', 7],
-    ['教师职业理念与职业道德', 6], ['职业教育与高等教育', 7]]],
-];
-const PLAN = PARTS.flatMap(P => P[1]);
+/* 卷面分两部分：第一部分整块公基，第二部分整块教基，每块内部打乱。
+   （抽题算法本身由 tests/test_server.py 的 TestMock 打真服务验；这里这几条是
+     后面那些断言的**前提**——桩扮演服务端，造出来的得是一张真实形状的卷子。） */
 const got = {};
 mock.ids.forEach(id => { const m = bankById[id].module; got[m] = (got[m] || 0) + 1; });
 const wrongMix = PLAN.filter(([m, n]) => got[m] !== n);
@@ -582,12 +726,12 @@ const firstEdu = seq.indexOf(1);
 ok(firstEdu === 60, `第一部分正好 60 题（实际 ${firstEdu}）`);
 ok(seq.slice(0, firstEdu).every(p => p === 0) && seq.slice(firstEdu).every(p => p === 1),
    '公基整块在前、教基整块在后，两部分不交错');
-const runs = a => { let r = 0; for (let i = 1; i < a.length; i++) if (a[i] !== a[i - 1]) r++; return r; };
 const mods1 = mock.ids.slice(0, 60).map(id => bankById[id].module);
 const mods2 = mock.ids.slice(60).map(id => bankById[id].module);
 ok(runs(mods1) > 30, `第一部分内部打乱了（模块切换 ${runs(mods1)} 次；按模块排只有 6 次）`);
 ok(runs(mods2) > 25, `第二部分内部打乱了（模块切换 ${runs(mods2)} 次；按模块排只有 4 次）`);
 
+/* ---------- 答题 ---------- */
 console.log('\n【模考 · 答题】');
 ok(/^\d+:\d\d$/.test(byId.mkClock.textContent), `倒计时在走：${byId.mkClock.textContent}`);
 ok((byId.mkCardPanel.innerHTML.match(/data-jump="/g) || []).length === 120, '答题卡有 120 格');
@@ -599,15 +743,17 @@ ok(/class="mk-part">第[一二]部分 · (公共基础知识|教育专业能力�
   ok(seps.length === 2, `答题卡里有两处分节标题（实际 ${seps.length}）`);
   ok(/^第一部分/.test(seps[0] || '') && /^第二部分/.test(seps[1] || ''),
      `答题卡分节标题：${seps.join(' / ')}`);
+  /* 分段是照**服务端给的 parts** 分的：分节标题必须正好插在第 60 格前面。
+     页面要是自己数了别的边界（或者干脆不分段），这里就红。 */
+  const chunks = byId.mkCardPanel.innerHTML.split('class="mk-sep">');
+  ok((chunks[1].match(/data-jump="/g) || []).length === 60,
+     `第一部分的格子直到第 60 格（实际 ${(chunks[1].match(/data-jump="/g) || []).length} 格）`);
 }
-const pickOpt = k => fires(byId.mkQ, { target: { closest: sel => sel === '[data-mk]'
-  ? { getAttribute: a => (a === 'data-mk' ? k : null) } : null } });
 
 const q0 = bankById[mock.ids[0]], q1 = bankById[mock.ids[1]], q2 = bankById[mock.ids[2]];
-const wrongOf = q => ['A', 'B', 'C', 'D'].find(k => k !== q.answer);
-pickOpt(wrongOf(q0));            // 第 1 题：故意答错
-fires(byId.mkNext, {}); pickOpt(q1.answer);   // 第 2 题：答对
-fires(byId.mkNext, {}); pickOpt(q2.answer);   // 第 3 题：答对
+pickOpt(wrongOf(q0)); await settle();                     // 第 1 题：故意答错
+fires(byId.mkNext, {}); pickOpt(q1.answer); await settle();   // 第 2 题：答对
+fires(byId.mkNext, {}); pickOpt(q2.answer); await settle();   // 第 3 题：答对
 ok(byId.mkDone.textContent == 3, `已答计数 = ${byId.mkDone.textContent}`);
 ok(byId.mkPos.textContent === '3 / 120', `题号 = ${byId.mkPos.textContent}`);
 const qHtml = byId.mkQ.innerHTML;
@@ -618,23 +764,30 @@ fires(byId.mkCardBtn, {});
 ok(byId.mkCardPanel.hidden === false, '点「答题卡」能展开');
 
 /* 键盘选答：按的是「显示字母」，存进去必须是「原始 key」。
-   这里正是我写错过的地方——原来直接把显示字母存了，乱序后会整整错一位。 */
-fires(byId.mkNext, {});
+   这里正是我写错过的地方——原来直接把显示字母存了，乱序后会整整错一位。
+   现在存哪儿由服务端说了算：断言看的是这一场（服务端那份）里的作答记录。 */
+fires(byId.mkNext, {}); await settle();
 const dispOrder = [...byId.mkQ.innerHTML.matchAll(/data-mk="([^"]+)"/g)].map(m => m[1]);
-const curId = JSON.parse(store['jiaokao-mock-2026']).ids[3];
+const curId = mock.ids[3];
 const kd = docListeners.find(l => l.t === 'keydown');
 ok(!!kd, '键盘监听已注册');
-kd.fn({ key: 'A' });
-ok(JSON.parse(store['jiaokao-mock-2026']).answers[curId] === dispOrder[0],
-   `按 A 存下的是显示在 A 位的原始 key（${dispOrder[0]}），不是字母 A`);
-kd.fn({ key: 'D' });
-ok(JSON.parse(store['jiaokao-mock-2026']).answers[curId] === dispOrder[3],
-   `按 D 存下的是显示在 D 位的原始 key（${dispOrder[3]}）`);
-pickOpt(bankById[curId].answer);   /* 第 4 题按显示位答对，后面的判分才可预期 */
+kd.fn({ key: 'A' }); await settle();
+ok((byId.mkQ.innerHTML.match(/<button class="opt picked"[^>]*data-mk="([^"]+)"/) || [])[1] === dispOrder[0],
+   `按 A 选中的是显示在 A 位的那一项（原始 key ${dispOrder[0]}）`);
+ok(mock.answers[curId] === dispOrder[0],
+   `按 A 记进这场模考的是原始 key（${dispOrder[0]}），不是字母 A`);
+kd.fn({ key: 'D' }); await settle();
+ok(mock.answers[curId] === dispOrder[3],
+   `按 D 记进这场模考的是显示在 D 位的原始 key（${dispOrder[3]}）`);
+pickOpt(bankById[curId].answer); await settle();   /* 第 4 题答对，后面的判分才可预期 */
 ok(byId.mkDone.textContent == 4, `已答计数 = ${byId.mkDone.textContent}`);
 
+/* ---------- 交卷判分 ---------- */
 console.log('\n【模考 · 交卷判分】');
 fires(byId.mkSubmitBtn, {});
+await settle();                       /* 交卷在服务端，是异步的 */
+ok(posts('/api/mock/submit').length === 1,
+   `交卷打的是服务端（POST /api/mock/submit 发了 ${posts('/api/mock/submit').length} 次）`);
 const res = byId.mkResult.innerHTML;
 ok(byId.mkResult.hidden === false, '交卷后显示成绩单');
 ok(byId.mkExam.hidden === true, '答题界面收起');
@@ -663,6 +816,9 @@ fires(byId.mkReview, {});
      '第一页顶部有「第一部分 · 公共基础知识」小标题');
   ok(!/<h3>第二部分/.test(byId.mkRev.innerHTML), '第一页（40 题）还没到第二部分');
   ok((byId.mkRev.innerHTML.match(/class="qz /g) || []).length === 40, '第一页 40 题');
+  /* 对错标签取的是服务端回的结果（wrong 列表）：这一场答错的是 q0 */
+  ok(byId.mkRev.innerHTML.includes('错，你选'),
+     '答错的题在解析里标成「错，你选 X」');
 
   /* 翻两页到第二部分，小标题要跟着出现。mkMore 是重写 innerHTML 建出来的，
      旧监听器在真实 DOM 里已失效，所以只点最后绑的那个。 */
@@ -676,41 +832,99 @@ fires(byId.mkReview, {});
   ok(/<h3>第二部分/.test(rev.slice(0, rev.indexOf('第二部分 · 教育'))) === false, '第二部分标题只出现一次');
 }
 
+/* ---------- 判分/抽题/交卷确实发生在服务端 ----------
+   上面每一条都能被「页面自己抽题、自己按答案判分」骗过去：把 /api/mock/* 全删掉、
+   在浏览器里 mkPick + 比答案，断言一条都不会红（任务 9 的 M4 就是这么发现的）。
+   而拆页的全部意义就在于抽题和判分都归服务端独一份。所以这里专盯两件事：
+     · 该发的请求有没有真的发出去（桩记了每一次请求）
+     · 渲染出来的是不是**响应体**（让桩回一个和本地算法相反的结果） */
+console.log('\n【模考 · 服务端说了算】');
+{
+  fires(byId.mkStart, {}); await settle();      /* 重开一场，验作答与交卷 */
+  const run = M.fetch.mock.run;
+  ok(run && Object.keys(run.answers).length === 0, '新开的一场是空卷（答案存在服务端那一场里）');
+
+  const qid = run.ids[0], ansQ = bankById[qid];
+  const n0 = posts('/api/mock/answer').length;
+  pickOpt(ansQ.answer); await settle();
+  const sent = posts('/api/mock/answer');
+  ok(sent.length === n0 + 1, `作答让 POST /api/mock/answer 恰好发出一次（${n0} → ${sent.length}）`);
+  ok(!!sent.length && sent[sent.length - 1].body
+     && sent[sent.length - 1].body.qid === qid && sent[sent.length - 1].body.chosen === ansQ.answer,
+     `请求体带的是这道题与所选项（${qid} → ${ansQ.answer}）`);
+  ok(run.answers[qid] === ansQ.answer, `作答记在了这一场里（${qid} → ${ansQ.answer}）`);
+  ok(ansQ.answer === bankById[qid].answer, `（前提）${qid} 答的是正确答案，本地判分绝不会算它错`);
+
+  /* 最强的一条：桩回一个和事实相反的响应体——分数 99、答对 119、错题是刚答对的
+     那一题。页面若自己算，这些数字一个都对不上。 */
+  M.fetch.mock.submitOverride = {
+    score: 99, right: 119, total: 120, unanswered: 1, used: 42,
+    submittedAt: Date.now(), wrong: [qid],
+    by_module: [{ module: ansQ.module, n: 120, right: 119 }],
+  };
+  fires(byId.mkSubmitBtn, {}); await settle();
+  M.fetch.mock.submitOverride = null;
+  const inner = byId.mkResult.innerHTML;
+  ok(/99<em>\/ 100<\/em>/.test(inner),
+     `分数取的是响应体（桩回 99，页面显示 ${(inner.match(/>([\d.]+)<em>\/ 100/) || [])[1]}）`);
+  ok(/答对 <b>119<\/b> \/ 120/.test(inner), '答对数也取响应体，不是页面自己数的');
+  const wb2 = JSON.parse(store['jiaokao-wrong-2026'] || '{}');
+  ok(wb2[qid] === 1,
+     `进错题本的题号认的也是响应体（${qid} 本地判分是答对的，只有响应体说它错）`);
+}
+
+/* ---------- 没考完的那场：接着答 ---------- */
+console.log('\n【模考 · 没考完接着答】');
+{
+  const B3 = await bootMock({ run: {
+    ids: MAIN_IDS, parts: PARTS.map(([name, mods]) => ({ name, n: mods.reduce((s, m) => s + m[1], 0) })),
+    answers: { [MAIN_IDS[0]]: 'A' }, i: 2,
+    startedAt: Date.now() - 600e3, endsAt: Date.now() + 3600e3,
+    submitted: false, submittedAt: 0,
+  } });
+  ok(B3.byId.mkExam.hidden === false, '有一场没考完的，回到页面直接接着答');
+  ok(B3.byId.mkResult.hidden === true, '没考完就不弹成绩单');
+  ok(/接着答/.test(B3.byId.mkResume.textContent),
+     `设置面板上写明接着答：${B3.byId.mkResume.textContent}`);
+  ok(B3.byId.mkPos.textContent === '3 / 120', `回到上次停下的那一题（${B3.byId.mkPos.textContent}）`);
+  ok(B3.byId.mkDone.textContent == 1, `已答计数按存档里的那份算（${B3.byId.mkDone.textContent}）`);
+  ok(B3.fetch.calls.filter(c => c.path === '/api/mock/submit').length === 0,
+     '接着答不该顺手把卷子交了');
+}
 
 /* ---------- 关着页面错过交卷时间 ---------- */
 console.log('\n【模考 · 页面关着时考卷过期】');
 {
   /* 这条路最容易被漏掉：考试时间在用户没开页面的时候走完，回来时只能判过期。
-     交卷和页内超时两条路都会并入成绩，这条如果忘了并入，那场的错题就永远进不了错题本。
-     所以整页重启一次，只喂一份「已过期、未交卷」的存档。 */
-  const prev = JSON.parse(store['jiaokao-mock-2026']);
-  const ids = prev.ids;
-  ok(ids.length === 120, `拿上一场的 ${ids.length} 道题号做存档`);
-
-  const plantWrong = ids.slice(0, 6), plantRight = ids.slice(6, 9);
+     手动交卷和页内超时两条路都会并入成绩，这条如果忘了并入，那场的错题就永远
+     进不了错题本。这里整页重启一次，只喂一场「已过期、未交卷」的卷子。 */
+  const plantWrong = MAIN_IDS.slice(0, 6), plantRight = MAIN_IDS.slice(6, 9);
   const mkAns = {};
-  plantWrong.forEach(id => { mkAns[id] = ['A','B','C','D'].find(k => k !== bankById[id].answer); });
+  plantWrong.forEach(id => { mkAns[id] = wrongOf(bankById[id]); });
   plantRight.forEach(id => { mkAns[id] = bankById[id].answer; });
+  ok(plantWrong.length === 6 && plantRight.length === 3,
+     `拿上一场的题号做存档（${plantWrong.length} 错 + ${plantRight.length} 对）`);
 
-  process.env.QUIET='1';
-  const B2 = bootMockLegacy({
-    'jiaokao-answers-2026': '{}',
-    'jiaokao-mock-2026': JSON.stringify({
-      ids: ids, parts: prev.parts, answers: mkAns, i: 0,
+  const B2 = await bootMock({
+    seedStore: { 'jiaokao-answers-2026': '{}', 'jiaokao-wrong-2026': '{}' },
+    run: {
+      ids: MAIN_IDS, parts: PARTS.map(([name, mods]) => ({ name, n: mods.reduce((s, m) => s + m[1], 0) })),
+      answers: mkAns, i: 0,
       startedAt: Date.now() - 7200e3,
       endsAt: Date.now() - 60e3,        /* 一分钟前就该交卷了 */
       submitted: false, submittedAt: 0,
-    }),
+    },
   });
 
-  delete process.env.QUIET;
+  ok(B2.fetch.calls.filter(c => c.path === '/api/mock/submit' && c.method === 'POST').length === 1,
+     '过期这条也走服务端交卷（POST /api/mock/submit 发了 1 次）');
   const merged = JSON.parse(B2.store['jiaokao-answers-2026'] || '{}');
-  const wb = JSON.parse(B2.store['jiaokao-wrong-2026'] || '{}');
+  const wbB = JSON.parse(B2.store['jiaokao-wrong-2026'] || '{}');
   ok(plantWrong.every(id => merged[id] === mkAns[id]),
      `过期存档里答错的 ${plantWrong.length} 题并入了成绩`);
-  ok(plantWrong.every(id => wb[id] === 1),
-     `并进了错题本（${plantWrong.filter(id => wb[id] === 1).length}/${plantWrong.length}）`);
-  ok(!plantRight.some(id => wb[id]), '答对的题没有误进错题本');
+  ok(plantWrong.every(id => wbB[id] === 1),
+     `并进了错题本（${plantWrong.filter(id => wbB[id] === 1).length}/${plantWrong.length}）`);
+  ok(!plantRight.some(id => wbB[id]), '答对的题没有误进错题本');
   ok(B2.byId.mkResult.hidden === false, '回到页面直接显示成绩单');
   ok(B2.byId.mkExam.hidden === true, '不再停在答题界面');
   const note = B2.byId.mkResult.innerHTML;
@@ -718,11 +932,46 @@ console.log('\n【模考 · 页面关着时考卷过期】');
   ok(new RegExp('答错的 <b>' + plantWrong.length + '</b>').test(note),
      `成绩单上的错题数 = ${plantWrong.length}`);
 }
+
+/* ---------- 配比表真来自服务端（换个配比，页面就得跟着变） ----------
+   上面「配比表」那段里的数字（120 / 60 / 50%）与页面里若有一份写死的表**恰好**
+   一样，所以那些断言分辨不出「照服务端渲染」和「页面写死」。这里喂一份现实中
+   不存在的配比（两部分 6 + 2 题、名字带「合成」），页面要还是 120/60/50%，
+   就说明它根本没读服务端那份。 */
+console.log('\n【模考 · 配比照服务端那份渲染】');
+{
+  const SYNTH = [
+    ['合成甲', [['教育学', 6]]],
+    ['合成乙', [['人文历史与科技常识', 2]]],
+  ];
+  const S2 = await bootMock({ ratio: SYNTH });
+  const plan = S2.byId.mkPlan.innerHTML;
+  ok(/第[一二]部分 · 合成甲/.test(plan) && /第[一二]部分 · 合成乙/.test(plan),
+     '配比表里的部分名照服务端给的那份写');
+  ok(/6 题 · 75%/.test(plan) && /2 题 · 25%/.test(plan),
+     `每部分的题量与占比按服务端那份算（8 题的 6/2）`);
+  /* 认死了合计那一行：`<td class="r">8</td>` 这种写法在模块行里也出现（公文写作就是 8 题），
+     不锚定 <tr class="sum"> 的话，写死 120 的页面照样能骗过这条。 */
+  ok(/<tr class="sum"><td>合计<\/td><td class="r">8<\/td>/.test(plan),
+     '合计 = 服务端的 8 题（不是页面写死的 120）');
+
+  firesOn(S2, S2.byId.mkStart, {}); await settle();
+  const grid = S2.byId.mkCardPanel.innerHTML;
+  ok((grid.match(/data-jump="/g) || []).length === 8,
+     `答题卡按服务端的 8 题排（实际 ${(grid.match(/data-jump="/g) || []).length} 格）`);
+  ok((grid.match(/class="mk-sep">/g) || []).length === 2, '两部分各有一个分节标题');
+  ok(/class="mk-part">第[一二]部分 · 合成甲</.test(S2.byId.mkQ.innerHTML)
+     || /class="mk-part">第[一二]部分 · 合成乙</.test(S2.byId.mkQ.innerHTML),
+     '题面上的部分名也来自服务端');
+  firesOn(S2, S2.byId.mkSubmitBtn, {}); await settle();
+  ok(/答对 <b>0<\/b> \/ 8/.test(S2.byId.mkResult.innerHTML),
+     '成绩单的总题数也是服务端那份（8）');
+}
 }
 
 (async function () {
   await quizSection();
-  mockSection();
+  await mockSection();
   console.log(failed ? `\n❌ ${failed} 项未通过` : '\n✅ 全部通过');
   process.exit(failed ? 1 : 0);
 })();

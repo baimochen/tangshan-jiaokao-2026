@@ -6,11 +6,14 @@
     python3 server.py            # 0.0.0.0:8000，手机连同一 WiFi 可访问
 """
 import argparse
+import datetime
 import json
 import os
+import random
 import socket
 import sqlite3
 import sys
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -41,6 +44,11 @@ class BadRequest(Exception):
     """客户端把请求写错了——对应 400，不是 500。"""
 
 
+class Insufficient(Exception):
+    """题库里的题不够抽一份卷子——对应 400。不是服务坏了，是题不够，
+    所以别让它冒到顶变成 500。"""
+
+
 def _int_arg(raw, default, lo, hi):
     """把查询串里的整数参数收进 [lo, hi]。
 
@@ -57,6 +65,116 @@ def _int_arg(raw, default, lo, hi):
     except (TypeError, ValueError):
         raise BadRequest(f'参数不是整数：{raw!r}')
     return max(lo, min(v, hi))
+
+
+# ==================== 模考 ====================
+# 配比表**只此一份**。客户端不再存第二份：页面渲染的「本卷配比」、成绩单的模块行与
+# 分组、每一部分的题量，全来自 GET /api/mock 的 parts。在别处再抄一份的后果是
+# ——页面写一套、服务端抽另一套，两边都不报错，考生拿到的是另一张卷子。
+MK_N = 120
+MK_SECONDS = 120 * 60
+# 唐山本地政策 + 校情仍然算在公基那 60 题里，只是单独标一组，
+# 免得在配比表里和公基四个模块混在一起看不出来。第三项就是小组名。
+MK_LOCAL = '地方特色 · 从公基匀出 · 不在大纲内'
+MK_PARTS = (
+    ('公共基础知识', (
+        ('公共基础 · 政治与时政', 16, None),
+        ('公共基础 · 法律', 13, None),
+        ('公共基础 · 经济、管理与常识', 11, None),
+        ('公共基础 · 公文写作', 8, None),
+        ('人文历史与科技常识', 6, None),
+        ('唐山工业职业技术大学校情', 3, MK_LOCAL),
+        ('唐山本地政策与时政', 3, MK_LOCAL),
+    )),
+    ('教育专业能力测验', (
+        ('教育学', 23, None),
+        ('教育心理学', 17, None),
+        ('教育法律法规', 7, None),
+        ('教师职业理念与职业道德', 6, None),
+        ('职业教育与高等教育', 7, None),
+    )),
+)
+
+
+def mock_plan():
+    """配比表：每部分的题量、每个模块的配额与小组名。
+
+    每部分的 n 由模块配额求和得出，不另写一份——两处各写一份迟早对不上。
+    """
+    out = []
+    for name, mods in MK_PARTS:
+        out.append({
+            'name': name,
+            'n': sum(n for _, n, _ in mods),
+            'modules': [dict([('module', m), ('n', n)] + ([('group', g)] if g else []))
+                        for m, n, g in mods],
+        })
+    return out
+
+
+def mock_pick(conn):
+    """抽题。与 考点体系.html 的 mkPick() 等价：
+
+    每部分先按模块配额凑齐（模块内部打乱），再把这一部分**整体打乱**，最后按
+    部分的顺序接起来。所以结果是「公基 60 题打散 + 教基 60 题打散」——两部分
+    之间不交错。少了「按部分接起来」这一步，考生就得在公基和教基之间来回跳。
+    """
+    pool = {}
+    for qid, mod in conn.execute('SELECT id, module FROM questions'):
+        pool.setdefault(mod, []).append(qid)
+    ids, parts = [], []
+    for name, mods in MK_PARTS:
+        out = []
+        for mod, quota, _g in mods:
+            have = list(pool.get(mod, []))       # 副本：打乱的是副本，不动 pool
+            random.shuffle(have)
+            if len(have) < quota:
+                raise Insufficient(f'题库不足: {mod} 需要 {quota} 只有 {len(have)}')
+            out.extend(have[:quota])
+        random.shuffle(out)
+        parts.append({'name': name, 'n': len(out)})
+        ids.extend(out)
+    return ids, parts
+
+
+def mock_grade(conn, state, submitted_at=None):
+    """给一份卷子判分。**只读，不改库。**
+
+    交卷和「页面重新打开、那场已经交过」两条路都走这里，所以「怎么算分」只有
+    一份实现。并进 attempts/错题本是交卷那一步单独做的事（见 do_POST 的 submit）。
+    逐题判的是 banklib.grade 那条规则（多选少选算错），不在模考里另写一份。
+    """
+    answers = state.get('answers') or {}
+    bank = {qid: (mod, typ, ans) for qid, mod, typ, ans in
+            conn.execute('SELECT id, module, type, answer FROM questions')}
+    per, wrong_ids, right = {}, [], 0
+    for qid in state['ids']:
+        mod, typ, ans = bank[qid]
+        r = per.setdefault(mod, {'n': 0, 'right': 0})
+        r['n'] += 1
+        chosen = answers.get(qid)
+        if not chosen:
+            continue                              # 未答既不算对也不算错
+        if banklib.grade(typ, ans, chosen):
+            right += 1
+            r['right'] += 1
+        else:
+            wrong_ids.append(qid)
+    total = len(state['ids'])
+    answered = sum(1 for v in answers.values() if v)
+    started = state.get('startedAt') or 0
+    # 用时只在交卷那一刻定下来：刷新成绩单不该把「用时」越算越长。
+    used = max(0, round((submitted_at - started) / 1000)) if submitted_at else 0
+    return {'score': round(right / total * 100, 1) if total else 0,
+            'right': right, 'total': total, 'unanswered': total - answered,
+            'wrong': wrong_ids, 'used': used, 'submittedAt': submitted_at or 0,
+            'by_module': [dict({'module': m}, **v) for m, v in per.items()]}
+
+
+def _iso(ms):
+    """毫秒时间戳 → 本地时区的 ISO 串（mock_runs 里两个 TEXT 列用）。"""
+    return datetime.datetime.fromtimestamp(ms / 1000).astimezone().isoformat(
+        timespec='seconds')
 
 
 def make_handler(db_path, web_dir=WEB):
@@ -88,6 +206,18 @@ def make_handler(db_path, web_dir=WEB):
                 return json.loads(self.rfile.read(n) or b'{}')
             except ValueError as e:
                 raise BadRequest(f'请求体不是合法 JSON：{e}')
+
+        def _mock_run(self, conn):
+            """最近那一场模考：返回 (行号, state 字典)，没有就 (None, None)。
+
+            永远取最新一行：新开的场次一定比旧的大，所以「进行中的那场」就是它。
+            旧行留着当历史，不删。
+            """
+            row = conn.execute(
+                'SELECT id, state FROM mock_runs ORDER BY id DESC LIMIT 1').fetchone()
+            if row is None:
+                return None, None
+            return row[0], json.loads(row[1])
 
         def _file(self, rel):
             path = os.path.normpath(os.path.join(web_dir, rel.lstrip('/')))
@@ -184,10 +314,117 @@ def make_handler(db_path, web_dir=WEB):
                 finally:
                     conn.close()
 
+            if u.path == '/api/mock':
+                # 模考页开局要的两样东西：一份配比表（渲染「本卷配比」与成绩单
+                # 分组），和最近那一场模考（页面刷新/关掉再打开靠它接着答或看成绩）。
+                conn = self._conn()
+                try:
+                    _rid, state = self._mock_run(conn)
+                    run = None
+                    if state is not None:
+                        run = state
+                        if state.get('submitted'):
+                            # 已交卷的那场：把成绩一并带上。这里只算不改库——
+                            # 重算一遍不能再把错次记一次。
+                            run['result'] = mock_grade(conn, state, state.get('submittedAt'))
+                    return self._send({'n': MK_N, 'seconds': MK_SECONDS,
+                                       'parts': mock_plan(), 'run': run})
+                finally:
+                    conn.close()
+
             return self._file(u.path)
 
         def do_POST(self):
             u = urllib.parse.urlparse(self.path)
+
+            if u.path == '/api/mock/start':
+                conn = self._conn()
+                try:
+                    try:
+                        ids, parts = mock_pick(conn)
+                    except Insufficient as e:
+                        return self._send({'error': str(e)}, 400)
+                    # 起止时间存毫秒：客户端要比 Date.now()，ISO 串还得再解一遍。
+                    now = int(time.time() * 1000)
+                    state = {'ids': ids, 'parts': parts, 'answers': {}, 'i': 0,
+                             'startedAt': now, 'endsAt': now + MK_SECONDS * 1000,
+                             'submitted': False, 'submittedAt': 0}
+                    conn.execute(
+                        'INSERT INTO mock_runs (started_at, ends_at, state) VALUES (?,?,?)',
+                        (_iso(now), _iso(now + MK_SECONDS * 1000),
+                         json.dumps(state, ensure_ascii=False)))
+                    conn.commit()
+                    return self._send(state)
+                finally:
+                    conn.close()
+
+            if u.path == '/api/mock/answer':
+                try:
+                    b = self._body()
+                except BadRequest as e:
+                    return self._send({'error': str(e)}, 400)
+                # qid 是「答了哪道题」，i 是「翻到第几题」——翻页不带 qid，
+                # 所以两者至少得有一个，不然这次请求什么也没说。
+                if not isinstance(b, dict) or (not b.get('qid') and b.get('i') is None):
+                    return self._send({'error': '请求体缺少 qid'}, 400)
+                if b.get('qid') and not isinstance(b.get('chosen'), str):
+                    return self._send({'error': 'chosen 要是字符串'}, 400)
+                conn = self._conn()
+                try:
+                    rid, state = self._mock_run(conn)
+                    if state is None or state.get('submitted'):
+                        return self._send({'error': '没有进行中的模考'}, 404)
+                    qid = b.get('qid')
+                    if qid:
+                        if qid not in state['ids']:
+                            return self._send(
+                                {'error': f'这场模考里没有这道题：{qid}'}, 404)
+                        state['answers'][qid] = b['chosen']
+                    if b.get('i') is not None:
+                        try:
+                            i = int(b['i'])
+                        except (TypeError, ValueError):
+                            return self._send({'error': 'i 不是整数'}, 400)
+                        state['i'] = max(0, min(i, len(state['ids']) - 1))
+                    conn.execute('UPDATE mock_runs SET state=? WHERE id=?',
+                                 (json.dumps(state, ensure_ascii=False), rid))
+                    conn.commit()
+                    return self._send({'ok': True, 'answered': sum(
+                        1 for v in state['answers'].values() if v)})
+                finally:
+                    conn.close()
+
+            if u.path == '/api/mock/submit':
+                try:
+                    self._body()
+                except BadRequest as e:
+                    return self._send({'error': str(e)}, 400)
+                conn = self._conn()
+                try:
+                    rid, state = self._mock_run(conn)
+                    if state is None:
+                        return self._send({'error': '没有进行中的模考'}, 404)
+                    # 幂等：交过的就只回上次的成绩。三条交卷路径（手动 / 页内超时 /
+                    # 关着页面过期）都打这个端点，客户端重入一次就会交两回——
+                    # 再并一次 attempts 会把错次平白记成 2。
+                    if state.get('submitted'):
+                        return self._send(
+                            mock_grade(conn, state, state.get('submittedAt')))
+                    now = int(time.time() * 1000)
+                    state['submitted'] = True
+                    state['submittedAt'] = now
+                    # 成绩并入作答记录：答错的自动进错题本。**三条交卷路径只有
+                    # 这一份实现**——漏掉任何一条，那场的错题就进不了错题本。
+                    for qid, chosen in state['answers'].items():
+                        if chosen:
+                            banklib.record_attempt(conn, qid, chosen)
+                    conn.execute('UPDATE mock_runs SET state=?, submitted_at=? WHERE id=?',
+                                 (json.dumps(state, ensure_ascii=False), _iso(now), rid))
+                    conn.commit()
+                    return self._send(mock_grade(conn, state, now))
+                finally:
+                    conn.close()
+
             if u.path == '/api/attempts':
                 try:
                     b = self._body()

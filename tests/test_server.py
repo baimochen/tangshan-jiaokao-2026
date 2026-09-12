@@ -67,6 +67,11 @@ class _ApiHelpers:
         self.assertEqual(code, 200, payload)
         return json.loads(payload)
 
+    def del_(self, path):
+        code, payload = self.raw(path, 'DELETE')
+        self.assertEqual(code, 200, payload)
+        return json.loads(payload)
+
     def count_in_db(self, sql, args=()):
         """拿真库当标尺。服务端报的 total 是 COUNT(*)，这里读同一份临时副本。"""
         conn = sqlite3.connect(self.db)
@@ -76,41 +81,42 @@ class _ApiHelpers:
             conn.close()
 
 
-class TestAPI(_ApiHelpers, unittest.TestCase):
-    """真起服务打真 HTTP。
+class ApiCase(_ApiHelpers, unittest.TestCase):
+    """真起服务打真 HTTP。起服务、拷库、拍真源快照都在这里，子类别抄第二遍。
 
-    本类**共用一台服务、一份临时库，逐条测试之间不做重置**。今天成立纯粹是因为
-    每条断言都只依赖它自己 POST 进去的那点数据（或先自己清空再断言）——不是因为有
-    隔离。后加测试时别假设自己是干净的库：要么自带前置数据，要么先 DELETE 再验。
+    **服务永远指着 bank.db 的临时副本。** bank.db 是入库产物、也是 git 里的真源，
+    而本文件的每个写操作（record_attempt 会 commit、DELETE /api/wrong 会清表）
+    都真的落盘——直接指着它跑，每跑一次测试就改一次真源，测试跑的还可能是要命的
+    那几条（TestMock 的 setUp 一上来就清空错题本）。所以：拷副本、在副本上打。
+
+    最后一道保险是 tearDownClass 里的真源快照比对：失败模式是「有人把 handler
+    又指回 bank.db」——那时它是**静默**被改的，跑完谁也不知道。拍个快照，对不上
+    就炸，让静默变出声。
     """
 
     @classmethod
-    def setUpClass(cls):
-        # 拷一份 bank.db 再起服务。bank.db 是入库产物、也是 git 里的真源，
-        # 而本文件会 POST 作答（record_attempt 会 commit）——直接指着它跑，
-        # 每跑一次测试就改一次真源。所以一律在临时副本上打。
-        cls.tmpdir = tempfile.mkdtemp(prefix='qbank-test-')
-        cls.db = os.path.join(cls.tmpdir, 'bank.db')
+    def prepare_db(cls, db_path):
+        """起服务前动一下临时副本（加题、改模块…）。基类不关心返回值。"""
+        return None
 
-        # 真源快照。这一步的失败模式是「有人把 handler 又指回 bank.db」——
-        # 那时它是**静默**被改的，跑完谁也不知道。拍个快照，在 tearDownClass 里
-        # 对不上就炸，让静默变出声。
+    @classmethod
+    def make_web(cls, tmpdir):
+        """静态文件的根。默认空目录——不请求静态文件的测试类不用管它。"""
+        web = os.path.join(tmpdir, 'web')
+        os.makedirs(web, exist_ok=True)
+        return web
+
+    @classmethod
+    def setUpClass(cls):
         cls.real_db = os.path.join(BASE, 'bank.db')
         cls.real_db_digest = _digest(cls.real_db)
 
+        cls.tmpdir = tempfile.mkdtemp(prefix='qbank-test-')
+        cls.db = os.path.join(cls.tmpdir, 'bank.db')
         shutil.copy2(cls.real_db, cls.db)
+        cls.prepared = cls.prepare_db(cls.db)
 
-        # 静态文件的根也放在临时目录：旁边故意放一个名字以 web 开头的兄弟目录，
-        # 用来验证目录穿越守卫不是靠 startswith 前缀「看起来对」。
-        cls.web = os.path.join(cls.tmpdir, 'web')
-        os.makedirs(os.path.join(cls.web, 'sub'))
-        with open(os.path.join(cls.web, 'index.html'), 'w', encoding='utf-8') as f:
-            f.write('<h1>qbank-home</h1>')
-        cls.sibling = os.path.join(cls.tmpdir, 'web-old')
-        os.makedirs(cls.sibling)
-        with open(os.path.join(cls.sibling, 'secret.txt'), 'w', encoding='utf-8') as f:
-            f.write('SECRET')
-
+        cls.web = cls.make_web(cls.tmpdir)
         # host 显式写 127.0.0.1：make_server 默认 0.0.0.0，测试不该把端口
         # 摊到局域网上（生产默认保持 0.0.0.0，那是手机连 WiFi 的前提）。
         cls.httpd = make_server(port=0, db=cls.db, host='127.0.0.1', web=cls.web)
@@ -127,6 +133,29 @@ class TestAPI(_ApiHelpers, unittest.TestCase):
         if _digest(cls.real_db) != cls.real_db_digest:
             raise AssertionError(
                 f'测试改动了真源 {cls.real_db}——服务必须指着临时副本，不能指回 bank.db')
+
+
+class TestAPI(ApiCase):
+    """取题 / 作答 / 统计 / 静态文件。
+
+    本类**共用一台服务、一份临时库，逐条测试之间不做重置**。今天成立纯粹是因为
+    每条断言都只依赖它自己 POST 进去的那点数据（或先自己清空再断言）——不是因为有
+    隔离。后加测试时别假设自己是干净的库：要么自带前置数据，要么先 DELETE 再验。
+    """
+
+    @classmethod
+    def make_web(cls, tmpdir):
+        # 静态文件的根也放在临时目录：旁边故意放一个名字以 web 开头的兄弟目录，
+        # 用来验证目录穿越守卫不是靠 startswith 前缀「看起来对」。
+        web = super().make_web(tmpdir)
+        os.makedirs(os.path.join(web, 'sub'))
+        with open(os.path.join(web, 'index.html'), 'w', encoding='utf-8') as f:
+            f.write('<h1>qbank-home</h1>')
+        cls.sibling = os.path.join(tmpdir, 'web-old')
+        os.makedirs(cls.sibling)
+        with open(os.path.join(cls.sibling, 'secret.txt'), 'w', encoding='utf-8') as f:
+            f.write('SECRET')
+        return web
 
     # ---- 取题 ----
     def test_取题默认一页40道(self):
@@ -354,7 +383,7 @@ def _add_questions(db_path, count):
         conn.close()
 
 
-class TestBigBank(_ApiHelpers, unittest.TestCase):
+class TestBigBank(ApiCase):
     """库比「贴着题量」的旧上限（1000）大时的整库取数。
 
     这是上限那条修正的回归测试：上限一旦贴近题量，整库取数就会被静默截断，
@@ -365,26 +394,14 @@ class TestBigBank(_ApiHelpers, unittest.TestCase):
     EXTRA = 5
 
     @classmethod
-    def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp(prefix='qbank-big-')
-        cls.db = os.path.join(cls.tmpdir, 'bank.db')
-        cls.real_db = os.path.join(BASE, 'bank.db')
-        cls.real_db_digest = _digest(cls.real_db)
-        shutil.copy2(cls.real_db, cls.db)
-        # 追加发生在临时副本上；真源只被读、被拍快照。
-        cls.base_count = _add_questions(cls.db, cls.EXTRA)
-        cls.httpd = make_server(port=0, db=cls.db, host='127.0.0.1')
-        cls.port = cls.httpd.server_address[1]
-        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+    def prepare_db(cls, db_path):
+        # 追加发生在临时副本上；真源只被读、被拍快照（快照在 ApiCase 里拍）。
+        return _add_questions(db_path, cls.EXTRA)
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        shutil.rmtree(cls.tmpdir, ignore_errors=True)
-        if _digest(cls.real_db) != cls.real_db_digest:
-            raise AssertionError(
-                f'测试改动了真源 {cls.real_db}——服务必须指着临时副本，不能指回 bank.db')
+    def setUp(self):
+        # prepare_db 的返回值（追加前的题数）。放这儿是因为 prepare_db 是类方法，
+        # 拿到它的返回值得等 setUpClass 跑完。
+        self.base_count = self.prepared
 
     def test_上限不截断整库(self):
         expect = self.count_in_db('SELECT COUNT(*) FROM questions')
@@ -398,6 +415,226 @@ class TestBigBank(_ApiHelpers, unittest.TestCase):
         # 条数必须等于库里真实题数：上限贴着题量就会截断，这里立刻红。
         self.assertEqual(len(d['questions']), expect)
         self.assertEqual(d['total'], expect)
+
+
+def _lookup(db_path, qid, col):
+    """从库里单查一个字段。测试要断言题目属性时用——不绕道 API，避免
+    拿被测代码的输出当自己断言的依据。
+
+    db_path 一律是 ApiCase 的临时副本（self.db），别指回真源 bank.db。
+    col 是**测试自己写死的字面量**（'module' / 'answer'），不是外部输入，
+    所以这里用 f-string 拼列名是安全的：没有注入面。调用点也只许传字面量。
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            f'SELECT {col} FROM questions WHERE id=?', (qid,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+class TestMock(ApiCase):
+    """模考端点：抽题配比、两部分不交错、答题期间不判分、交卷才并进错题本。
+
+    每条测试自己 POST 一场新卷子；答题记录/错题本靠 setUp 清空，所以互不污染。
+    """
+
+    # ---- 测试自己的配比依据 ----
+    # MK_PARTS 的模块表在 server.py 里只有一份，这里是**测试独立抄的一份**：
+    # 断言要的是「服务端抽出来的题量对得上配比」，拿服务端自己的表当期望就成
+    # 了同义反复。**server.py 的 MK_PARTS 改了，这两组模块名必须跟着改。**
+    #
+    # 分「公基段 / 教基段」按**模块名**，不按 section：唐山本地政策与校情那两组
+    # 的 section 是 local / school，不是 pub，用 section=='pub' 分只会在今天这版
+    # 数据上碰巧切一次，并没有真的验到「两部分不交错」。
+    MK_PUB = ('公共基础 · 政治与时政', '公共基础 · 法律', '公共基础 · 经济、管理与常识',
+              '公共基础 · 公文写作', '人文历史与科技常识',
+              '唐山工业职业技术大学校情', '唐山本地政策与时政')
+    MK_EDU = ('教育学', '教育心理学', '教育法律法规',
+              '教师职业理念与职业道德', '职业教育与高等教育')
+    QUOTA = {'公共基础 · 政治与时政': 16, '公共基础 · 法律': 13,
+             '公共基础 · 经济、管理与常识': 11, '公共基础 · 公文写作': 8,
+             '人文历史与科技常识': 6, '唐山工业职业技术大学校情': 3,
+             '唐山本地政策与时政': 3,
+             '教育学': 23, '教育心理学': 17, '教育法律法规': 7,
+             '教师职业理念与职业道德': 6, '职业教育与高等教育': 7}
+
+    def setUp(self):
+        # 每个测试从空错题本开始，否则测试之间互相污染，红绿不可复现
+        self.del_('/api/wrong')
+
+    def seg_of(self, qid):
+        """这道题属于哪一段：MK_PARTS 是 公基段 + 教基段，两段。"""
+        mod = _lookup(self.db, qid, 'module')
+        if mod in self.MK_PUB:
+            return 'pub'
+        if mod in self.MK_EDU:
+            return 'edu'
+        self.fail(f'{mod} 不在测试的 MK_PARTS 模块表里——'
+                  f'server.py 的配比改了，TestMock.MK_PUB / MK_EDU 要跟着改')
+
+    def test_抽题120道不重复(self):
+        d = self.post('/api/mock/start', {})
+        self.assertEqual(len(d['ids']), 120)
+        self.assertEqual(len(set(d['ids'])), 120)
+        # 抽出来的 id 必须真在库里：凭空的 id 到了判分那步才会炸，那时已经晚了。
+        full = {q['id'] for q in self.get('/api/questions', limit=1000000)['questions']}
+        self.assertTrue(set(d['ids']) <= full, '抽到了库里没有的题号')
+
+    def test_题目配比符合配比表(self):
+        """每个模块抽到的题量 = 配比表里的数。少抽一个模块、配额写错都会在这儿红。"""
+        d = self.post('/api/mock/start', {})
+        got = {}
+        for qid in d['ids']:
+            mod = _lookup(self.db, qid, 'module')
+            got[mod] = got.get(mod, 0) + 1
+        only_got = {m: n for m, n in got.items() if self.QUOTA.get(m) != n}
+        want = {m: n for m, n in self.QUOTA.items() if got.get(m) != n}
+        self.assertEqual((only_got, want), ({}, {}),
+                         f'配比不符：多抽/少抽 {only_got}；应有而没有 {want}')
+        self.assertEqual(sum(got.values()), 120)
+        # 配比表本身：公基 60 + 教基 60，各半。
+        self.assertEqual(sum(n for m, n in self.QUOTA.items() if m in self.MK_PUB), 60)
+        self.assertEqual(sum(n for m, n in self.QUOTA.items() if m in self.MK_EDU), 60)
+
+    def test_两部分不交错(self):
+        d = self.post('/api/mock/start', {})
+        segs = [self.seg_of(i) for i in d['ids']]
+        # 两段的话序列只该切换 1 次。切了 2 次以上就是公基/教基交错——
+        # 真实卷子是按部分连排的，交错会让考生来回跳。
+        switches = sum(1 for a, b in zip(segs, segs[1:]) if a != b)
+        self.assertEqual(switches, 1, f'模块段被打断，共 {switches + 1} 段')
+        # 只数切换次数的话，教基在前、公基在后也是 1 次——那是另一张卷子。
+        # 公基必须在第一部分，而且正好 60 题。
+        self.assertEqual(segs[0], 'pub', '第一部分必须是公基')
+        self.assertEqual(segs.count('pub'), 60)
+        self.assertEqual(segs.count('edu'), 60)
+
+    def test_答题期间不判分不进错题本(self):
+        d = self.post('/api/mock/start', {})
+        qid = d['ids'][0]
+        # 挑一个必错的作答：选对了的话「没进错题本」是白绿。
+        ans = _lookup(self.db, qid, 'answer')
+        wrong = next(k for k in 'ABCD' if k != ans)
+        b_wrong = self.get('/api/wrong')['total']
+        b_done = self.get('/api/stats')['done']
+        self.assertEqual(b_wrong, 0, '（前提）setUp 清空后错题本该是空的')
+        self.post('/api/mock/answer', {'qid': qid, 'chosen': wrong})
+        self.assertEqual(self.get('/api/wrong')['total'], b_wrong,
+                         '答题期间就进了错题本——判分该等交卷')
+        self.assertEqual(self.get('/api/stats')['done'], b_done,
+                         '答题期间就写了作答记录——判分该等交卷')
+
+    def test_交卷才并进错题本(self):
+        d = self.post('/api/mock/start', {})
+        ids = d['ids'][:5]
+        right_id = ids[0]
+        for qid in ids:
+            ans = _lookup(self.db, qid, 'answer')
+            chosen = ans if qid == right_id else next(k for k in 'ABCD' if k != ans)
+            self.post('/api/mock/answer', {'qid': qid, 'chosen': chosen})
+        self.assertEqual(self.get('/api/wrong')['total'], 0, '交卷前错题本该是空的')
+
+        r = self.post('/api/mock/submit', {})
+        self.assertIn('score', r)
+        self.assertIn('by_module', r)
+        # 5 题里 1 对 4 错。服务端要是把「合并 attempts」那一步去掉，错题本这条就红。
+        self.assertEqual(r['right'], 1)
+        self.assertEqual(r['score'], round(1 / 120 * 100, 1))
+        self.assertEqual(r['total'], 120)
+        self.assertEqual(r['unanswered'], 115)
+        self.assertEqual({x['id'] for x in self.get('/api/wrong')['questions']}, set(ids[1:]),
+                         '答错的没全进错题本')
+        # 答对的那道不能误进错题本——「全都判错」也能让上面那行绿。
+        self.assertNotIn(right_id, [x['id'] for x in self.get('/api/wrong')['questions']])
+        self.assertEqual(set(r['wrong']), set(ids[1:]))
+        # by_module 是给成绩单分模块用的：题量与答对数都要对得上。
+        self.assertEqual(sum(m['n'] for m in r['by_module']), 120)
+        self.assertEqual(sum(m['right'] for m in r['by_module']), 1)
+
+    def test_重复交卷不重复计分(self):
+        """三条交卷路径（手动 / 页内超时 / 关着页面过期）都打同一个端点，
+        客户端重入一次就会交两回。第二次必须是幂等的：只回上次的成绩，
+        不再把错次记一遍。"""
+        d = self.post('/api/mock/start', {})
+        qid = d['ids'][0]
+        ans = _lookup(self.db, qid, 'answer')
+        self.post('/api/mock/answer',
+                  {'qid': qid, 'chosen': next(k for k in 'ABCD' if k != ans)})
+        r1 = self.post('/api/mock/submit', {})
+        r2 = self.post('/api/mock/submit', {})
+        self.assertEqual(r1['score'], r2['score'])
+        wc = {x['id']: x['wrong_count'] for x in self.get('/api/wrong')['questions']}
+        self.assertEqual(wc[qid], 1, '交两次把错次记成了 2')
+
+    def test_GET返回配比表与进行中的那场(self):
+        d = self.get('/api/mock')
+        self.assertEqual(d['n'], 120)
+        self.assertEqual(d['seconds'], 120 * 60)
+        parts = d['parts']
+        self.assertEqual([p['name'] for p in parts], ['公共基础知识', '教育专业能力测验'])
+        self.assertEqual([p['n'] for p in parts], [60, 60])
+        # 配置表逐模块对：客户端不再存一份配比，它渲染的就是这里。
+        mods = [m for p in parts for m in p['modules']]
+        self.assertEqual({m['module']: m['n'] for m in mods}, self.QUOTA)
+        self.assertEqual(sum(m['n'] for m in mods), 120)
+        # 唐山/校情那两组要带上小组名，成绩单上的「地方特色」标组靠它。
+        grp = {m['module']: m.get('group') for m in mods if m.get('group')}
+        self.assertEqual(set(grp), {'唐山工业职业技术大学校情', '唐山本地政策与时政'})
+        self.assertEqual(len(set(grp.values())), 1)
+
+        # 开一场之后，GET 要把这一场带回来——页面刷新/关掉再打开靠它接上。
+        started = self.post('/api/mock/start', {})
+        run = self.get('/api/mock')['run']
+        self.assertFalse(run['submitted'])
+        self.assertEqual(run['ids'], started['ids'])
+        self.assertEqual([p['name'] for p in run['parts']], ['公共基础知识', '教育专业能力测验'])
+        self.assertEqual(run['endsAt'] - run['startedAt'], 120 * 60 * 1000)
+
+    def test_交卷后GET带回成绩单(self):
+        """已交卷的那场：GET 带回的成绩必须和 submit 当时一致，而且**不能**
+        因为重算又把错次记一遍。"""
+        d = self.post('/api/mock/start', {})
+        qid = d['ids'][0]
+        ans = _lookup(self.db, qid, 'answer')
+        self.post('/api/mock/answer',
+                  {'qid': qid, 'chosen': next(k for k in 'ABCD' if k != ans)})
+        r = self.post('/api/mock/submit', {})
+
+        run = self.get('/api/mock')['run']
+        self.assertTrue(run['submitted'])
+        self.assertEqual(run['result']['score'], r['score'])
+        self.assertEqual(run['result']['right'], r['right'])
+        self.assertEqual(set(run['result']['wrong']), set(r['wrong']))
+        wc = {x['id']: x['wrong_count'] for x in self.get('/api/wrong')['questions']}
+        self.assertEqual(wc[qid], 1, 'GET 重算成绩时又把错次记了一遍')
+
+
+class TestMockShort(ApiCase):
+    """题库某个模块不够题时的抽题失败路径。
+
+    「题库不足: X 需要 N 只有 M」这句是原页面 mkPick() 的行为，搬过来必须还在，
+    而且是 400（客户端写错了？不，是题库真的不够——但它不是 500）。
+    """
+
+    @classmethod
+    def prepare_db(cls, db_path):
+        # 把教基的题目改名换姓：教育学模块就空了。用 UPDATE 不动行数，
+        # 免得撞上 attempts/wrong 的外键。
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("UPDATE questions SET module='改走了 · 测试用' WHERE module='教育学'")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_题库不足返回400而不是半个场次(self):
+        code, payload = self.raw('/api/mock/start', method='POST', body={})
+        self.assertEqual(code, 400, payload)
+        err = json.loads(payload)['error']
+        self.assertIn('题库不足: 教育学 需要 23 只有 0', err)
+        # 抽题半路失败不该留下一场空卷子：GET 得说没有进行中的那场。
+        self.assertIsNone(self.get('/api/mock')['run'])
 
 
 if __name__ == '__main__':
