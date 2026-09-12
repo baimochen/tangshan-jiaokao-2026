@@ -20,9 +20,14 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(BASE, 'web')
 DB = os.path.join(BASE, 'bank.db')
 
-# limit 的上限。刷题页要「一次取全库再在浏览器里筛」（未做/错题/模块三个 tab 和
-# stats() 都吃全量），?limit=1000 是真实用法，必须放行；再大就没有意义了。
-LIMIT_MAX = 1000
+# limit 的**下界**才是真保护：SQLite 里 LIMIT -1 表示「不限」，不夹住的话
+# ?limit=-1 会把整库倒出去（这正是 E 修正要挡的东西）。上界只是防有人塞个
+# 10**20 进来：正数的上限本来就由库的大小兜着——不可能返回比库里还多的行——
+# 所以这里定得很松。**别把它收紧成「当前题量」**：刷题页要「一次取全库再在
+# 浏览器里筛」（未做/错题/模块三个 tab 和 stats() 都吃全量），上限一旦贴着
+# 题量，库涨过那个数就会静默截断，页面上的未做数、模块筛、统计全跟着错，
+# 而且不报任何错。
+LIMIT_MAX = 1000000
 LIMIT_MIN = 1
 # offset 没有「整库」这种上限，但也得有个界，免得有人塞个 10**30 进来。
 OFFSET_MAX = 10 ** 9
@@ -39,11 +44,13 @@ class BadRequest(Exception):
 def _int_arg(raw, default, lo, hi):
     """把查询串里的整数参数收进 [lo, hi]。
 
-    缺省/空串 = 没传，走 default；不是整数 = 客户端写错了，抛 BadRequest（→400）。
+    raw 为 None = 没传，走 default；不是整数 = 客户端写错了，抛 BadRequest（→400）。
+    （不会收到空串：parse_qs 默认 keep_blank_values=False，`?limit=` 直接不产生
+    这个键，one('limit') 拿到的就是 None——所以这里没有空串分支。）
     **夹范围不是可选的**：SQLite 里 LIMIT -1 表示「不限」，不夹住的话
     ?limit=-1 会把整库倒出去；offset 负数也别指望 SQLite 的行为。
     """
-    if raw is None or raw == '':
+    if raw is None:
         return default
     try:
         v = int(raw)
@@ -87,6 +94,9 @@ def make_handler(db_path, web_dir=WEB):
             # 挡住 ../ 穿越。必须比对 WEB + os.sep：只 startswith(WEB) 的话，
             # 兄弟目录 web-old/ 的名字也以 WEB 开头，会被当成「在 web/ 里面」放行。
             # web_dir 本身（请求就是 "/"）是合法根，单独放行。
+            # 注意这是**纯字面上的**路径比较，不做 realpath：web/ 里如果有人放一个
+            # 指向外面的软链，下面的 isfile/open 照样会跟过去。本地单用户够用，
+            # 但别把「挡住穿越」读成「挡住一切越界」。
             if path != web_dir and not path.startswith(web_dir + os.sep):
                 return self._send({'error': 'forbidden'}, 403)
             if os.path.isdir(path):
@@ -200,19 +210,25 @@ def make_handler(db_path, web_dir=WEB):
 
         def do_DELETE(self):
             u = urllib.parse.urlparse(self.path)
-            conn = self._conn()
-            try:
-                if u.path == '/api/attempts':
+            # 连接开在分支里面，和 do_GET/do_POST 一致：路由没匹配上就不该碰库，
+            # 否则每个 404 的 DELETE 都白开一次连接。
+            if u.path == '/api/attempts':
+                conn = self._conn()
+                try:
                     conn.execute('DELETE FROM attempts')
                     conn.execute('DELETE FROM wrong')
                     conn.commit()
                     return self._send({'ok': True})
-                if u.path == '/api/wrong':
+                finally:
+                    conn.close()
+            if u.path == '/api/wrong':
+                conn = self._conn()
+                try:
                     conn.execute('DELETE FROM wrong')
                     conn.commit()
                     return self._send({'ok': True})
-            finally:
-                conn.close()
+                finally:
+                    conn.close()
             return self._send({'error': 'not found'}, 404)
 
     return Handler

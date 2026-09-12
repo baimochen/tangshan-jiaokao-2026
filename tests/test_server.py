@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """API 端点。起真实服务打真实请求——mock 掉 HTTP 就测不出路由和序列化的问题。"""
+import hashlib
 import json
 import os
 import shutil
@@ -16,7 +17,20 @@ from server import make_server
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _digest(path):
+    """文件的 sha256。用来给真源 bank.db 拍快照。"""
+    with open(path, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 class TestAPI(unittest.TestCase):
+    """真起服务打真 HTTP。
+
+    本类**共用一台服务、一份临时库，逐条测试之间不做重置**。今天成立纯粹是因为
+    每条断言都只依赖它自己 POST 进去的那点数据（或先自己清空再断言）——不是因为有
+    隔离。后加测试时别假设自己是干净的库：要么自带前置数据，要么先 DELETE 再验。
+    """
+
     @classmethod
     def setUpClass(cls):
         # 拷一份 bank.db 再起服务。bank.db 是入库产物、也是 git 里的真源，
@@ -24,7 +38,14 @@ class TestAPI(unittest.TestCase):
         # 每跑一次测试就改一次真源。所以一律在临时副本上打。
         cls.tmpdir = tempfile.mkdtemp(prefix='qbank-test-')
         cls.db = os.path.join(cls.tmpdir, 'bank.db')
-        shutil.copy2(os.path.join(BASE, 'bank.db'), cls.db)
+
+        # 真源快照。这一步的失败模式是「有人把 handler 又指回 bank.db」——
+        # 那时它是**静默**被改的，跑完谁也不知道。拍个快照，在 tearDownClass 里
+        # 对不上就炸，让静默变出声。
+        cls.real_db = os.path.join(BASE, 'bank.db')
+        cls.real_db_digest = _digest(cls.real_db)
+
+        shutil.copy2(cls.real_db, cls.db)
 
         # 静态文件的根也放在临时目录：旁边故意放一个名字以 web 开头的兄弟目录，
         # 用来验证目录穿越守卫不是靠 startswith 前缀「看起来对」。
@@ -48,6 +69,11 @@ class TestAPI(unittest.TestCase):
         cls.httpd.shutdown()
         cls.httpd.server_close()
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
+        # 断言真源没被动过。放在最后（前面几步先清理干净），失败时是 error，
+        # 会把整条测试记红——这正是想要的：静默改真源比测试红严重得多。
+        if _digest(cls.real_db) != cls.real_db_digest:
+            raise AssertionError(
+                f'测试改动了真源 {cls.real_db}——服务必须指着临时副本，不能指回 bank.db')
 
     # ---- 请求工具 ----
     def url(self, path, **params):
@@ -121,7 +147,9 @@ class TestAPI(unittest.TestCase):
         # total 是真计数，拿库里同模块的真实条数当标尺：WHERE 写错列会当场红。
         expect = self.count_in_db('SELECT COUNT(*) FROM questions WHERE module=?', (mod,))
         self.assertEqual(d['total'], expect)
-        self.assertEqual(len(d['questions']), min(expect, 1000))
+        # 必须 == expect，不能写成 min(expect, 1000)：那等于把「截断」写进期望里，
+        # 库涨过上限之后两条断言照样绿，而页面其实只拿到一部分题。
+        self.assertEqual(len(d['questions']), expect)
 
     def test_按类型筛(self):
         # 别写死 1000——第 4 步会加判断题和多选题，写死了到时候必红。
@@ -131,7 +159,8 @@ class TestAPI(unittest.TestCase):
         self.assertTrue(all(q['type'] == 'single' for q in d['questions']))
         expect = self.count_in_db("SELECT COUNT(*) FROM questions WHERE type='single'")
         self.assertEqual(d['total'], expect)
-        self.assertEqual(len(d['questions']), min(expect, 1000))
+        # 同上：== expect，别把截断写进期望。
+        self.assertEqual(len(d['questions']), expect)
 
     def test_分页不重叠(self):
         a = {q['id'] for q in self.get('/api/questions', limit=40, offset=0)['questions']}
@@ -190,18 +219,66 @@ class TestAPI(unittest.TestCase):
         self.assertTrue(hit['options'], 'options 没解成 JSON 数组')
         self.assertEqual(hit['chosen'], wrong)
 
+    # ---- 统计与清空（唯一会写库的两条路由 + 只被手工 curl 打过的 stats）----
+    def test_统计与清空(self):
+        # 本类共用一份库，别的测试也写作答记录——先清空把基线钉死。
+        # 顺带这就是 DELETE 的第一遍：清空后统计必须归零。
+        code, _ = self.raw('/api/attempts', method='DELETE')
+        self.assertEqual(code, 200)
+        d = self.get('/api/stats')
+        self.assertEqual(d['total'], self.count_in_db('SELECT COUNT(*) FROM questions'))
+        self.assertEqual((d['done'], d['right'], d['rate']), (0, 0, 0))
+        self.assertEqual(d['by_module'], [])
+
+        qs = self.get('/api/questions', limit=2)['questions']
+        wrong = 'A' if qs[0]['answer'] != 'A' else 'B'
+        self.post('/api/attempts', {'qid': qs[0]['id'], 'chosen': wrong})
+        self.post('/api/attempts', {'qid': qs[1]['id'], 'chosen': qs[1]['answer']})
+
+        d = self.get('/api/stats')
+        self.assertEqual(d['done'], 2)
+        self.assertEqual(d['right'], 1)
+        self.assertEqual(d['rate'], 50)             # round(1/2*100)
+        # by_module 逐字段对：题目分属哪个模块由库决定，不写死模块名。
+        expect = {}
+        for q, ok in ((qs[0], False), (qs[1], True)):
+            e = expect.setdefault(q['module'], {'module': q['module'], 'total': 0, 'right': 0})
+            e['total'] += 1
+            e['right'] += 1 if ok else 0
+        self.assertEqual({m['module']: m for m in d['by_module']}, expect)
+
+        # DELETE /api/wrong 只清错题本，作答记录得留着——这是两条路由的分界。
+        code, _ = self.raw('/api/wrong', method='DELETE')
+        self.assertEqual(code, 200)
+        self.assertEqual(self.get('/api/wrong')['total'], 0)
+        self.assertEqual(self.get('/api/stats')['done'], 2)
+
+        # 再错一次，把错题本重新填上——否则下面「一起清」那条断言是空的：
+        # 错题本刚才已经被上一步清干净了，清不清都看不出差别。
+        self.post('/api/attempts', {'qid': qs[0]['id'], 'chosen': wrong})
+        self.assertEqual(self.get('/api/wrong')['total'], 1)
+
+        # DELETE /api/attempts 两张表一起清。
+        code, _ = self.raw('/api/attempts', method='DELETE')
+        self.assertEqual(code, 200)
+        self.assertEqual(self.get('/api/stats')['done'], 0)
+        self.assertEqual(self.get('/api/stats')['right'], 0)
+        self.assertEqual(self.get('/api/wrong')['total'], 0)
+
     # ---- 参数校验 ----
     def test_负数limit不会倒出整库(self):
         # SQLite 里 LIMIT -1 是「不限」——不夹住的话 ?limit=-1 整库下发。
         d = self.get('/api/questions', limit=-1)
         self.assertEqual(len(d['questions']), 1)
 
-    def test_超大limit夹到上限(self):
-        big = self.get('/api/questions', limit=100000)
-        cap = self.get('/api/questions', limit=1000)
-        self.assertEqual([q['id'] for q in big['questions']],
-                         [q['id'] for q in cap['questions']])
-        self.assertEqual(len(big['questions']), 1000)
+    def test_超大limit返回全库(self):
+        # 比「和 ?limit=1000 一样」强：库正好 1000 条时那两个请求本来就一样，
+        # 分辨不出「上限=1000」还是「上限很松」。这里直接拿库的真实题数当标尺——
+        # 一旦有人把上限收紧到贴着题量，这条立刻红。
+        expect = self.count_in_db('SELECT COUNT(*) FROM questions')
+        d = self.get('/api/questions', limit=100000)
+        self.assertEqual(len(d['questions']), expect)
+        self.assertEqual(d['total'], expect)
 
     def test_负offset当0(self):
         d = self.get('/api/questions', limit=40, offset=-5)
