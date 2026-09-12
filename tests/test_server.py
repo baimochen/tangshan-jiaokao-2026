@@ -746,5 +746,140 @@ class TestMockStaleBank(ApiCase):
         self.assertEqual(run['result']['right'], 1)
 
 
+class TestMigrate(ApiCase):
+    """POST /api/migrate/legacy：老页面 localStorage 里的记录并库。
+
+    **本类必须继承 ApiCase、不许另写 setUpClass。** 这个端点真的往 attempts /
+    wrong 里写行，正是 ApiCase 存在的理由（临时副本 + tearDownClass 的真源快照）。
+    手抄一份 setUpClass 就是漏掉那行 shutil.copy2 / 快照比对的经典方式——
+    那时写的是真源 bank.db，而且静默。
+
+    每条测试自己先清空两张表（DELETE /api/attempts 一次清两表）。本类共用一台
+    服务、一份临时库，不重置的话一条测试的导入会把下一条的计数带偏。
+    """
+
+    def setUp(self):
+        self.del_('/api/attempts')
+
+    def _pick(self, i):
+        """题库里第 i 道题：返回 (qid, 正确答案, 一个错的选项 key)。
+
+        正确答案走 _lookup 直读库（不拿被测 API 的输出当断言依据）；选项 key
+        从 API 拿，只用来构造一份「必定答错」的输入。
+        """
+        q = self.get('/api/questions', limit=1, offset=i)['questions'][0]
+        ans = _lookup(self.db, q['id'], 'answer')
+        bad = next(o['key'] for o in q['options'] if o['key'] != ans)
+        return q['id'], ans, bad
+
+    def _row(self, sql, qid):
+        """从临时副本里单查一行。断言一律拿真库当标尺，不看服务端回了什么。"""
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(sql, (qid,)).fetchone()
+        finally:
+            conn.close()
+
+    def _attempt(self, qid):
+        return self._row('SELECT chosen, correct FROM attempts WHERE qid=?', qid)
+
+    def _wrong(self, qid):
+        """错题本里的行：(chosen, wrong_count, resolved)，没有就 None。"""
+        return self._row('SELECT chosen, wrong_count, resolved FROM wrong WHERE qid=?', qid)
+
+    # ---- 正常导入 ----
+    def test_旧记录写进attempts与wrong(self):
+        q1, a1, bad1 = self._pick(0)
+        q2, a2, _bad2 = self._pick(1)
+        d = self.post('/api/migrate/legacy',
+                      {'answers': {q1: bad1, q2: a2}, 'wrong': {q1: 1}})
+        self.assertEqual(d, {'imported': 2, 'skipped': 0})
+
+        # 作答原样落库，correct 由服务端按现在的题库判
+        self.assertEqual(self._attempt(q1), (bad1, 0))
+        self.assertEqual(self._attempt(q2), (a2, 1))
+        # 判错的进错题本，判对的不能进——「全都记成错」也能让上面那半条绿
+        self.assertEqual(self._wrong(q1), (bad1, 1, 0))
+        self.assertIsNone(self._wrong(q2))
+
+    def test_导完已做数与统计对得上(self):
+        """刷题页的「已做」就是 /api/stats 的 done，导入后必须和旧数据条数一致。"""
+        n = 5
+        answers, wrong = {}, {}
+        for i in range(n):
+            qid, ans, bad = self._pick(i)
+            if i % 2:
+                answers[qid], wrong[qid] = bad, 1
+            else:
+                answers[qid] = ans
+
+        d = self.post('/api/migrate/legacy', {'answers': answers, 'wrong': wrong})
+        self.assertEqual((d['imported'], d['skipped']), (n, 0))
+        st = self.get('/api/stats')
+        self.assertEqual(st['done'], n)
+        self.assertEqual(st['right'], n - len(wrong))
+        self.assertEqual(self.get('/api/wrong')['total'], len(wrong))
+
+    def test_只有wrong没有answers的题号也进错题本(self):
+        """老数据两张表各存各的：只记了错、没记作答的题号不能丢。"""
+        q, _ans, _bad = self._pick(0)
+        d = self.post('/api/migrate/legacy', {'answers': {}, 'wrong': {q: 1}})
+        self.assertEqual(d, {'imported': 1, 'skipped': 0})
+        self.assertIsNone(self._attempt(q), '没作答就不该写 attempts 行')
+        self.assertEqual(self._wrong(q), (None, 1, 0), '只记了错的那道没进错题本')
+
+    # ---- 题库换代（C34）：跳过并计数，绝不整批失败 ----
+    def test_题库里没有的题号跳过而不是整批失败(self):
+        q1, _a1, bad1 = self._pick(0)
+        q2, a2, _b2 = self._pick(1)
+        d = self.post('/api/migrate/legacy', {
+            'answers': {q1: bad1, 'zz-上一代题库-1': 'A', 'zz-上一代题库-2': 'B'},
+            'wrong': {q2: 1, 'zz-上一代题库-1': 1}})
+        # 死的题号在两张表里都出现过，去重后是 2 条——不是 3 条
+        self.assertEqual(d, {'imported': 2, 'skipped': 2})
+        # 好的一样进库：发现一个坏题号就整批放弃的写法在这里会红
+        self.assertEqual(self._attempt(q1), (bad1, 0))
+        self.assertEqual(self._wrong(q2), (None, 1, 0))
+
+    def test_全是死题号也回200而不是500(self):
+        """一个死题号都没有时最坏：外键错误（IntegrityError）会变成 500，
+        客户端只看到「导入失败」，几百条记录一条都没进来。"""
+        code, payload = self.raw('/api/migrate/legacy', method='POST', body={
+            'answers': {'zz-旧-1': 'A'}, 'wrong': {'zz-旧-2': 1}})
+        self.assertEqual(code, 200, payload)
+        self.assertEqual(json.loads(payload), {'imported': 0, 'skipped': 2})
+        self.assertEqual(self.count_in_db('SELECT COUNT(*) FROM attempts'), 0)
+        self.assertEqual(self.count_in_db('SELECT COUNT(*) FROM wrong'), 0)
+
+    # ---- 错次（C35）----
+    def test_导入的错次一律是1(self):
+        """老数据里没有错次这个概念（老代码写死 w[qid]=1），给多少都是 1。"""
+        q1, _a1, bad1 = self._pick(0)
+        q2, _a2, _b2 = self._pick(1)
+        d = self.post('/api/migrate/legacy',
+                      {'answers': {q1: bad1}, 'wrong': {q1: 7, q2: 3}})
+        self.assertEqual(d['imported'], 2)
+        self.assertEqual(self._wrong(q1), (bad1, 1, 0))   # 传的是 7
+        self.assertEqual(self._wrong(q2), (None, 1, 0))   # 传的是 3
+
+    def test_重导一遍不把错次累加(self):
+        """新刷题页写的正是同一对 key，所以首页那个按钮会再出现、重导是常态。"""
+        q, _ans, bad = self._pick(0)
+        body = {'answers': {q: bad}, 'wrong': {q: 1}}
+        self.post('/api/migrate/legacy', body)
+        self.post('/api/migrate/legacy', body)
+        self.assertEqual(self._wrong(q), (bad, 1, 0), '重导一次把错次记成了 2')
+        self.assertEqual(self.count_in_db('SELECT COUNT(*) FROM attempts'), 1)
+
+    # ---- 坏请求 ----
+    def test_坏请求返回400(self):
+        for body in ({'answers': '不是对象'}, {'wrong': [1, 2]}, [1, 2], '不是对象'):
+            code, payload = self.raw('/api/migrate/legacy', method='POST', body=body)
+            self.assertEqual(code, 400, f'{body!r} → {code} {payload!r}')
+        # 两个键都缺 = 没什么可导的，不是写错了：照 200 回 0/0。
+        self.assertEqual(self.post('/api/migrate/legacy', {}),
+                         {'imported': 0, 'skipped': 0})
+
+
 if __name__ == '__main__':
     unittest.main()

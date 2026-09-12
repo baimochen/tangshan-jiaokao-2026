@@ -482,6 +482,30 @@ def make_handler(db_path, web_dir=WEB):
                     return self._send({'error': str(e)}, 404)
                 finally:
                     conn.close()
+
+            if u.path == '/api/migrate/legacy':
+                # 旧版页面（localStorage）的记录并库：一次性的桥，给拆页前
+                # 已经刷过题的用户用（首页那个按钮打的就是这里）。
+                try:
+                    b = self._body()
+                except BadRequest as e:
+                    return self._send({'error': str(e)}, 400)
+                # 给的不是对象才是写错了（400）。两个键缺省当空——首页那个按钮
+                # 永远两个都给，但手工 curl 只给一个也该跑得起来，那不是错误。
+                if not isinstance(b, dict):
+                    return self._send({'error': '请求体要是对象'}, 400)
+                for k in ('answers', 'wrong'):
+                    if b.get(k) is not None and not isinstance(b[k], dict):
+                        return self._send({'error': f'{k} 要是 {{qid: 值}} 形状的对象'}, 400)
+                conn = self._conn()
+                try:
+                    # 写库与「题库里没有的题号就跳过」都在 banklib.import_legacy 里：
+                    # 作答/错题两张表的 SQL 只住在 banklib，路由只管 HTTP 这一层。
+                    imported, skipped = banklib.import_legacy(
+                        conn, b.get('answers') or {}, b.get('wrong') or {})
+                    return self._send({'imported': imported, 'skipped': skipped})
+                finally:
+                    conn.close()
             return self._send({'error': 'not found'}, 404)
 
         def do_DELETE(self):

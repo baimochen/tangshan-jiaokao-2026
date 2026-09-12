@@ -79,6 +79,17 @@ body{
 .quick a.study{border-left:3px solid var(--indigo)}
 .quick .t{display:block;font-weight:700;font-size:14.5px;color:var(--ink);margin-bottom:3px}
 .quick .d{display:block;font-size:12.5px;color:var(--slate);line-height:1.55}
+/* 「导入旧版记录」按钮（由 home.js 建出来，两个老 key 都在时才有）。
+   观感复用上面那组卡片：同一套表面色/描边/圆角，只是左边一条朱红竖线标明
+   它是一次性动作而不是一个入口；横跨整栅格，免得看着像第 17 个分类。 */
+.quick .legacy{grid-column:1/-1;display:block;width:100%;text-align:left;cursor:pointer;
+  font-family:inherit;font-size:14.5px;font-weight:700;color:var(--ink);
+  background:var(--surface);border:1px solid var(--rule);border-left:3px solid var(--cinnabar);
+  border-radius:3px;padding:14px 16px}
+.quick .legacy:hover:not(:disabled){border-color:var(--indigo)}
+.quick .legacy:disabled{opacity:.55;cursor:default}
+.quick .legacy .d{display:block;font-weight:400;font-size:12.5px;color:var(--slate);
+  line-height:1.55;margin-top:3px}
 
 /* ---------- compact masthead ---------- */
 .masthead{padding-bottom:14px}

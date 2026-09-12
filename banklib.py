@@ -70,6 +70,73 @@ def record_attempt(conn, qid, chosen):
             'wrong_count': wc[0] if wc else 0}
 
 
+def _put_legacy_wrong(conn, qid, chosen, now):
+    """把「这一题错过」写进错题本（旧记录迁移专用，见 import_legacy）。
+
+    与 record_attempt 里那条 upsert 是同一张表，但语义不同，刻意分开写：
+      · wrong_count **固定 1、不累加**——旧数据里根本没有错次（老代码写死
+        w[qid]=1），重导一次不该变成 2。
+      · resolved 不动。那行要是已经被重做对了，这次导入没有理由把它翻回
+        「还没掌握」——旧记录不比新记录更权威。
+      · chosen 库里已经有就留着（COALESCE），别让一份更旧的记录把它盖掉。
+    """
+    conn.execute(
+        "INSERT INTO wrong (qid,chosen,wrong_count,first_at,last_at,resolved) "
+        "VALUES (?,?,1,?,?,0) "
+        "ON CONFLICT(qid) DO UPDATE SET chosen=COALESCE(wrong.chosen, excluded.chosen), "
+        "last_at=excluded.last_at",
+        (qid, chosen, now, now))
+
+
+def import_legacy(conn, answers, wrong):
+    """把旧页面 localStorage 里的记录并进 attempts / wrong。返回 (imported, skipped)。
+
+    老数据的两张表各存各的：answers[qid] 是选中的选项 key（'A' / 'ABD'），
+    w[qid] 一律是 1（**旧代码写死的就是 1**）。所以导进来的 wrong_count 一律是 1
+    ——错次这个概念在旧数据里不存在，是不可恢复的信息，不是这里的缺陷。
+
+    查不到的题号一律**跳过并计数**，绝不整批失败：老记录可能来自上一代题库
+    （id 换了一批），而 attempts.qid / wrong.qid 都是 REFERENCES questions(id)，
+    一个外键错（IntegrityError）就会把几百条记录变成一次 500，用户只看到
+    「导入失败」，还一条都没进来。skipped 要回给用户，让他知道漏了多少。
+
+    幂等：同一份数据重导一遍不会多出行、也不会把错次累加成 2。这不是多余的
+    讲究——新刷题页写的正是同一对 localStorage key，所以首页那个按钮会再出现，
+    重导是常态。
+    """
+    bank = {qid: (typ, ans) for qid, typ, ans in
+            conn.execute('SELECT id, type, answer FROM questions')}
+    skipped = set()
+    imported = 0
+    now = _now()
+    for qid, chosen in answers.items():
+        row = bank.get(qid)
+        if row is None or not isinstance(chosen, str):
+            skipped.add(qid)          # 题库里没有 / 作答不是字符串：跳过这一条
+            continue
+        ok = grade(row[0], row[1], chosen)      # 判分只有这一份实现
+        conn.execute(
+            "INSERT INTO attempts (qid,chosen,correct,at) VALUES (?,?,?,?) "
+            "ON CONFLICT(qid) DO UPDATE SET chosen=excluded.chosen, "
+            "correct=excluded.correct, at=excluded.at",
+            (qid, chosen, 1 if ok else 0, now))
+        if not ok:
+            _put_legacy_wrong(conn, qid, chosen, now)
+        imported += 1
+    for qid in wrong:
+        if qid not in bank:
+            skipped.add(qid)
+            continue
+        if qid in answers:
+            # 上一步已经处理过：判错的已进错题本，判对的按**现在的**题库算对。
+            # 不为「旧数据说它错」再补一行——对错由服务端那份答案说了算。
+            continue
+        _put_legacy_wrong(conn, qid, None, now)   # 只记了错、没记作答的题号
+        imported += 1
+    conn.commit()
+    return imported, len(skipped)
+
+
 def list_questions(conn, section=None, module=None, qtype=None,
                    limit=40, offset=0, include_answer=True):
     """取题。limit/offset 翻的是**结果集**，只是让调用方不必一次渲染完。
