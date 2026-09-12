@@ -162,14 +162,26 @@ class TestImportBank(unittest.TestCase):
         # 刻意复用同一个 db 文件：import_bank() 每次都会 executescript(schema.sql)，
         # schema.sql 若没有 IF NOT EXISTS，第二次导入会抛
         # OperationalError: table questions already exists——bank.db 就只能生成一次。
-        # 第二次返回的题数必须和第一次一样，且表里恰好只剩这一份：
-        # 说明 runs 的是覆盖（DELETE FROM questions），不是追加。
-        self.write_json([copy.deepcopy(GOOD)])
-        self.assertEqual(import_bank(self.json_path, self.db), 1)
-        self.assertEqual(import_bank(self.json_path, self.db), 1)
+        # 用 3 题而不是 1 题：追加会变 6、只覆盖一部分会落在 4/5，都能被下面的
+        # COUNT(*) 抓到。
+        self.write_json(self._三题())
+        self.assertEqual(import_bank(self.json_path, self.db), 3)
+        # 返回值是 len(questions)（从 JSON 读出来，见 import_bank.py 末尾
+        # return len(questions)），不是库里的行数，所以它对「有没有追加」不敏感。
+        # 这次调用只负责触发第二次导入，不断言返回值——真正的守卫是下面 COUNT(*)。
+        import_bank(self.json_path, self.db)
         conn = open_db(self.db)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute('SELECT COUNT(*) FROM questions').fetchone()[0], 1)
+        self.assertEqual(conn.execute('SELECT COUNT(*) FROM questions').fetchone()[0], 3)
+
+    def _三题(self):
+        # 三份 GOOD，id / n 各不相同，才能同时入库。
+        qs = []
+        for i, qid in enumerate(('e101', 'e102', 'e103'), start=1):
+            q = copy.deepcopy(GOOD)
+            q['id'], q['n'] = qid, i
+            qs.append(q)
+        return qs
 
     def _写一好一坏两题(self):
         # 好题先 INSERT 成功，坏题再撞 questions.stem 的 NOT NULL。

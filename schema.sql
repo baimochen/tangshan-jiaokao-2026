@@ -7,10 +7,16 @@
 PRAGMA foreign_keys = ON;
 
 -- 下面全部 DDL 都用 IF NOT EXISTS：import_bank() 每次导入都会执行本脚本，
--- 库已存在时不能炸（否则 bank.db 只能生成一次，任何重跑都报
--- 「table questions already exists」）。同理**不能**改用 DROP TABLE：
--- attempts / wrong 靠 ON DELETE CASCADE 挂在 questions 上，
--- 库一旦删掉就等于连用户的作答历史和错题本一起清空。
+-- 裸 CREATE TABLE 会让第二次导入在 executescript 处抛
+-- 「table questions already exists」——bank.db 就只生成得了这一次。
+-- IF NOT EXISTS 才是让重跑导入能走通的原因。
+--
+-- 但要说清楚：这里**没有**保住用户的作答历史。attempts / wrong 靠
+-- ON DELETE CASCADE 挂在 questions 上，而 import_bank() 每次导入都执行
+-- DELETE FROM questions，级联照样清空 attempts / wrong——open_db() 已经
+-- 打开了 PRAGMA foreign_keys，所以级联今天就在生效，效果和
+-- DROP TABLE questions 没有区别。要保住历史，得改那个 DELETE
+-- （比如 upsert，或先删不触发级联的关联行），与这里用不用 IF NOT EXISTS 无关。
 -- 代价：若 bank.db 是旧结构，IF NOT EXISTS 会静默跳过，不做结构升级——
 -- 升级留到真有需要时显式处理。
 
