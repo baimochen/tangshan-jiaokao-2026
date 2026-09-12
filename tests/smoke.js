@@ -136,17 +136,29 @@ function makeStub(html, nav, opts) {
    只桩引擎真正用到的那两条路由（GET /api/questions、POST /api/attempts）：
    多桩一条就多一处会和真实服务脱节的地方。
    判分刻意走一遍和 banklib.grade 相同的规则（去重、排序、转大写、比集合），
-   好让「多选题少选算错」这类规则在客户端也成立。 */
+   好让「多选题少选算错」这类规则在客户端也成立。
+
+   桩会把**每一次请求**记进 `calls`，并留一个 `override` 口子（见下）。
+   这两个都不是为了「更真实」，是为了让「判分确实发生在服务端」有断言可依：
+   没有它们，把引擎改回本地按答案比，整套断言一条都不会红（任务 9 的 M4 突变）。 */
 const norm = s => [...new Set((s || '').trim().toUpperCase())].sort().join('');
 
 function installFetchStub() {
   const wrongCount = new Map();   // qid → 累计错次（banklib.record_attempt 的语义）
+  const calls = [];               // 每一次请求：{path, method, body}
   const okJSON = obj => ({ ok: true, status: 200, statusText: 'OK', json: async () => obj });
   const errJSON = (status, error) => ({ ok: false, status, statusText: 'error', json: async () => ({ error }) });
+
+  /* override：让某一道题的 POST 直接回指定的响应体，不按本地规则算。
+     用来断言「页面渲染的是响应体」——本地算法会判对的题，桩偏说错，
+     页面若跟着判错，结论就只可能来自响应。用完置回 null。 */
+  const stub = { calls, wrongCount, override: null };
 
   global.fetch = async function (url, opts) {
     const u = new URL(url, 'http://stub');
     const q = u.searchParams;
+    calls.push({ path: u.pathname, method: (opts && opts.method) || 'GET',
+                 body: opts && opts.body ? JSON.parse(opts.body) : null });
     if (u.pathname === '/api/questions') {
       const mod = q.get('module'), sec = q.get('section'), typ = q.get('type');
       const list = BANK.questions.filter(x =>
@@ -161,6 +173,11 @@ function installFetchStub() {
       // 库里没这道题：服务端是 404 + {'error':…}。桩里照同一个形状回，
       // 引擎才不会把「题不在库里」当成「记上了」。
       if (!item) return errJSON(404, '题库里没有这道题：' + b.qid);
+      if (stub.override && stub.override.qid === b.qid) {
+        const o = stub.override;
+        return okJSON({ correct: o.correct, answer: o.answer,
+                        explanation: o.explanation, wrong_count: o.wrong_count });
+      }
       const correct = norm(b.chosen) === norm(item.answer);
       if (!correct) wrongCount.set(b.qid, (wrongCount.get(b.qid) || 0) + 1);
       return okJSON({ correct, answer: item.answer, explanation: item.explanation,
@@ -168,6 +185,7 @@ function installFetchStub() {
     }
     return errJSON(404, 'not found');
   };
+  return stub;   /* calls / override 交给 bootQuiz 转出去，给断言用 */
 }
 
 /* ---------- 装配一：拆页后的刷题页 ---------- */
@@ -196,7 +214,7 @@ async function bootQuiz() {
      本页引擎压根不查导航（导航本身由 node tests/check_dom.js 验），这里要的只是
      那份导航表——建 section 与 .nav-list a 都用它，不再从 HTML 里正则抓 <a href="#x">。 */
   const S = makeStub(QUIZ_HTML, nav, { idsFromHtml: true, readyState: 'loading', hiddenIds: ['qempty'] });
-  installFetchStub();
+  S.fetch = installFetchStub();   /* 断言要看请求记录与 override 口子 */
 
   /* 按页面里的实际顺序 eval。索引 0 是 nav.js，要单独接一下它的产物。 */
   eval(readAsset(PAGE_SCRIPTS[0]));
@@ -458,6 +476,47 @@ async function quizSection() {
     ok(/ABC\s*理论/.test(abcExp), 'p16（ABC 理论）已渲染出来');
     ok(/A\s*是诱发事件/.test(abcExp) && /B\s*是信念/.test(abcExp) && /C\s*是情绪/.test(abcExp),
        'ABC 理论的 A/B/C 没被当成选项指代改掉（换了就把解析讲反了）');
+  }
+
+  /* ---------- 判分这件事确实发生在服务端 ----------
+     上面每一条都能被「本地按答案比」骗过去：把 POST /api/attempts 整个删掉、
+     改成 res = { correct: k === q.answer }，99 条断言一条都不会红。而拆页的
+     全部意义就在于判分归 banklib.grade 独一份——所以这里补两条专盯它的：
+       · 作答有没有真的发出那个请求（桩记了每一次请求）
+       · 渲染出来的结论取的是不是响应体（让桩返回一个和本地算法相反的结果）
+     缺了它们，「谁把引擎改回本地判分」不会有任何人吭声。 */
+  console.log('\n【判分由服务端定】');
+  {
+    const posts = () => B.fetch.calls.filter(c => c.path === '/api/attempts' && c.method === 'POST');
+    const q9 = BANK.questions[9];
+    const wk9 = ['A', 'B', 'C', 'D'].find(k => k !== q9.answer);
+    const n0 = posts().length;
+    fires(byId.qlist, { target: { closest: sel => sel === '.opt'
+      ? { disabled: false, getAttribute: k => (k === 'data-q' ? q9.id : wk9) } : null } });
+    await settle();
+    const sent = posts();
+    ok(sent.length === n0 + 1, `作答让 POST /api/attempts 恰好发出一次（${n0} → ${sent.length}）`);
+    ok(!!sent.length && sent[sent.length - 1].body
+       && sent[sent.length - 1].body.qid === q9.id && sent[sent.length - 1].body.chosen === wk9,
+       `请求体带的是这道题与所选项（${q9.id} → ${wk9}）`);
+
+    /* 更强的一条：本地的规则会判「对」，桩偏说「错」，页面信谁一目了然。
+       q10 用户选的就是它的正确答案，本地比较必然 correct:true。 */
+    const q10 = BANK.questions[10];
+    B.fetch.override = { qid: q10.id, correct: false, answer: q10.answer,
+                         explanation: q10.explanation, wrong_count: 7 };
+    fires(byId.qlist, { target: { closest: sel => sel === '.opt'
+      ? { disabled: false, getAttribute: k => (k === 'data-q' ? q10.id : q10.answer) } : null } });
+    await settle();
+    B.fetch.override = null;
+    const a10 = JSON.parse(store['jiaokao-answers-2026'] || '{}')[q10.id];
+    ok(a10 === q10.answer, `（前提）${q10.id} 选的是正确答案，本地算法会判对`);
+    /* 重渲染一次看整页（引擎只替换单张卡，桩的 querySelector 回 null，重渲染最稳） */
+    fires(fbtns.find(b => b.getAttribute('data-filter') === 'all'), {});
+    ok(byId.qlist.innerHTML.includes('class="qz wrong" data-card="' + q10.id + '"'),
+       '服务端回 correct:false，页面就按「答错」渲染（结论取自响应体，不是本地算的）');
+    ok(JSON.parse(store['jiaokao-wrong-2026'] || '{}')[q10.id] === 1,
+       '这一题因此进了错题本——错题本认的也是服务端判的分');
   }
 }
 
