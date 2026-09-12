@@ -23,7 +23,60 @@ def _digest(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
-class TestAPI(unittest.TestCase):
+class _ApiHelpers:
+    """起好服务之后共用的那几条请求工具。子类负责在 setUpClass 里备好
+    self.port / self.db / self.httpd。"""
+
+    def url(self, path, **params):
+        if params:
+            path += ('&' if '?' in path else '?') + urllib.parse.urlencode(params)
+        return f'http://127.0.0.1:{self.port}{path}'    # 参数统一 urlencode：中文模块名不能裸拼
+
+    def get(self, path, **params):
+        with urllib.request.urlopen(self.url(path, **params)) as r:
+            return json.loads(r.read())
+
+    def get_text(self, path):
+        """静态文件用：4xx 时也把状态码和正文拿回来，不抛。"""
+        try:
+            with urllib.request.urlopen(self.url(path)) as r:
+                return r.status, r.read().decode('utf-8')
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, e.read().decode('utf-8')
+            finally:
+                e.close()      # 4xx 的响应体也是打开的流，不关会 ResourceWarning
+
+    def raw(self, path, method='GET', body=None, raw_body=None):
+        """要状态码时用这个：urlopen 对 4xx/5xx 抛 HTTPError，先接住再断言。"""
+        data = raw_body if raw_body is not None else (
+            None if body is None else json.dumps(body).encode())
+        req = urllib.request.Request(self.url(path), data=data, method=method,
+                                     headers={'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, e.read()
+            finally:
+                e.close()
+
+    def post(self, path, body):
+        code, payload = self.raw(path, 'POST', body)
+        self.assertEqual(code, 200, payload)
+        return json.loads(payload)
+
+    def count_in_db(self, sql, args=()):
+        """拿真库当标尺。服务端报的 total 是 COUNT(*)，这里读同一份临时副本。"""
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(sql, args).fetchone()[0]
+        finally:
+            conn.close()
+
+
+class TestAPI(_ApiHelpers, unittest.TestCase):
     """真起服务打真 HTTP。
 
     本类**共用一台服务、一份临时库，逐条测试之间不做重置**。今天成立纯粹是因为
@@ -74,55 +127,6 @@ class TestAPI(unittest.TestCase):
         if _digest(cls.real_db) != cls.real_db_digest:
             raise AssertionError(
                 f'测试改动了真源 {cls.real_db}——服务必须指着临时副本，不能指回 bank.db')
-
-    # ---- 请求工具 ----
-    def url(self, path, **params):
-        if params:
-            path += ('&' if '?' in path else '?') + urllib.parse.urlencode(params)
-        return f'http://127.0.0.1:{self.port}{path}'    # 参数统一 urlencode：中文模块名不能裸拼
-
-    def get(self, path, **params):
-        with urllib.request.urlopen(self.url(path, **params)) as r:
-            return json.loads(r.read())
-
-    def get_text(self, path):
-        """静态文件用：4xx 时也把状态码和正文拿回来，不抛。"""
-        try:
-            with urllib.request.urlopen(self.url(path)) as r:
-                return r.status, r.read().decode('utf-8')
-        except urllib.error.HTTPError as e:
-            try:
-                return e.code, e.read().decode('utf-8')
-            finally:
-                e.close()      # 4xx 的响应体也是打开的流，不关会 ResourceWarning
-
-    def raw(self, path, method='GET', body=None, raw_body=None):
-        """要状态码时用这个：urlopen 对 4xx/5xx 抛 HTTPError，先接住再断言。"""
-        data = raw_body if raw_body is not None else (
-            None if body is None else json.dumps(body).encode())
-        req = urllib.request.Request(self.url(path), data=data, method=method,
-                                     headers={'Content-Type': 'application/json'})
-        try:
-            with urllib.request.urlopen(req) as r:
-                return r.status, r.read()
-        except urllib.error.HTTPError as e:
-            try:
-                return e.code, e.read()
-            finally:
-                e.close()
-
-    def post(self, path, body):
-        code, payload = self.raw(path, 'POST', body)
-        self.assertEqual(code, 200, payload)
-        return json.loads(payload)
-
-    def count_in_db(self, sql, args=()):
-        """拿真库当标尺。服务端报的 total 是 COUNT(*)，这里读同一份临时副本。"""
-        conn = sqlite3.connect(self.db)
-        try:
-            return conn.execute(sql, args).fetchone()[0]
-        finally:
-            conn.close()
 
     # ---- 取题 ----
     def test_取题默认一页40道(self):
@@ -324,6 +328,76 @@ class TestAPI(unittest.TestCase):
         code, body = self.get_text('/../web-old/secret.txt')
         self.assertEqual(code, 403, f'穿越到兄弟目录被放行了：{body}')
         self.assertNotIn('SECRET', body)
+
+
+def _add_questions(db_path, count):
+    """往临时库追 count 道合法单选题，返回追加前的题数。
+
+    形状必须过 schema 的约束：n 唯一、type 在枚举里、options 是 JSON 数组、
+    answer 的字母得在选项里。n 从库里现有的 MAX(n) 往后接，不写死——库涨了也不撞。
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        base = conn.execute('SELECT COUNT(*) FROM questions').fetchone()[0]
+        next_n = (conn.execute('SELECT MAX(n) FROM questions').fetchone()[0] or 0) + 1
+        for i in range(count):
+            opts = [{'key': k, 'text': f'选项{k}'} for k in 'ABCD']
+            conn.execute(
+                'INSERT INTO questions (id,n,section,module,type,stem,options,answer,'
+                'explanation,batch) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                (f'zz-extra-{next_n + i}', next_n + i, 'edu', '教育学', 'single',
+                 f'扩容题 {next_n + i}', json.dumps(opts, ensure_ascii=False), 'A',
+                 f'扩容题 {next_n + i} 的解析', 2))
+        conn.commit()
+        return base
+    finally:
+        conn.close()
+
+
+class TestBigBank(_ApiHelpers, unittest.TestCase):
+    """库比「贴着题量」的旧上限（1000）大时的整库取数。
+
+    这是上限那条修正的回归测试：上限一旦贴近题量，整库取数就会被静默截断，
+    刷题页的未做数/模块筛/统计跟着错而不报任何错。夹具特意造成 bank.db + 5 行，
+    稳稳越过旧上限。
+    """
+
+    EXTRA = 5
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix='qbank-big-')
+        cls.db = os.path.join(cls.tmpdir, 'bank.db')
+        cls.real_db = os.path.join(BASE, 'bank.db')
+        cls.real_db_digest = _digest(cls.real_db)
+        shutil.copy2(cls.real_db, cls.db)
+        # 追加发生在临时副本上；真源只被读、被拍快照。
+        cls.base_count = _add_questions(cls.db, cls.EXTRA)
+        cls.httpd = make_server(port=0, db=cls.db, host='127.0.0.1')
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+        if _digest(cls.real_db) != cls.real_db_digest:
+            raise AssertionError(
+                f'测试改动了真源 {cls.real_db}——服务必须指着临时副本，不能指回 bank.db')
+
+    def test_上限不截断整库(self):
+        expect = self.count_in_db('SELECT COUNT(*) FROM questions')
+        # 夹具形状自查：题数就是 bank.db + EXTRA，且必须**大于旧上限 1000**——
+        # 只有比上限大，这条才咬得住「上限贴着题量」的截断。
+        # （bank.db 现在是 1000 且只增不减，所以 expect = 1005 > 1000 恒成立；
+        #   这里写死的是 1000 这个旧上限常量，不是当前题量，不会随库增长而烂掉。）
+        self.assertEqual(expect, self.base_count + self.EXTRA)
+        self.assertGreater(expect, 1000)
+        d = self.get('/api/questions', limit=1000000)
+        # 条数必须等于库里真实题数：上限贴着题量就会截断，这里立刻红。
+        self.assertEqual(len(d['questions']), expect)
+        self.assertEqual(d['total'], expect)
 
 
 if __name__ == '__main__':
