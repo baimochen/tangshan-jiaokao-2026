@@ -6,10 +6,13 @@
    以前这里手抄了一份 isOptRef / remapExplain，改线上那份、不改这份，
    探针照样一片绿——那正是这个任务要防的错。现在：
      · 两个函数按大括号配对从 quiz.js 里抠出来 eval，抠不到就报错退出；
-     · 下面 remapExplainTrace（追踪版，为了拿到每个字母串的判定）用的
-       isOptRef 就是抠出来的那份，规则一条都不自己写；
-     · 追踪版的循环 vs 源码版的循环，1000 题逐题比对输出，不一致就报错退出。
-   三条合起来：探针测的就是线上那份逻辑，测不到就红。
+     · **追踪版连常量都不自己存**：连续串的正则、往回看/往前看的窗口宽度，
+       全从抠出来的 remapExplain 源码里读（读不到就抛）。漏一个常量就等于手抄没除净——
+       评审量过：源码的窗口 6 改成 20，探针曾一片绿。
+     · 追踪版的循环 vs 源码版的循环，1000 题**外加每条合成串**逐题比对输出，
+       不一致就报错退出（合成串里有专门造出来区分窗口宽度的输入）。
+     · 合成用例的期望值是写死的字符串，规则一拆/窗口一改就红。
+   四条合起来：探针测的就是线上那份逻辑，测不到就红。
    usage: node tools/remap_probe.js */
 const fs = require('fs');
 const path = require('path');
@@ -57,7 +60,37 @@ function shownKey(q, key) {
   for (let i = 0; i < a.length; i++) if (a[i].key === key) return letterAt(i);
   return key;
 }
-const shownKeyFor = q => key => shownKey(q, key);
+
+const SYN = { id: SYN_ID, type: 'multi', answer: 'ABD',
+              options: [{ key: 'A', text: '甲' }, { key: 'B', text: '乙' },
+                        { key: 'C', text: '丙' }, { key: 'D', text: '丁' }] };
+/* 合成用例。期望值是写死的字符串（置换 A→C B→A C→D D→B 也是写死的），
+   每条都得能被突变打红——见 task-14-report.md 的突变表。
+   前后两组「窗口」用例是修复轮 1 加的：真库上区分不出窗口 6 和更宽的窗口，
+   所以单造两条只有「字母前面/后面隔了 ≥6 个空白」才分岔的输入。
+   隔 8 个空格时 `故选` / 「两项」落在 6 字符窗口之外——按现状不换；
+   谁把窗口放宽，这两条立刻红（改窗口是个要拿出来讨论的决定，不是顺手调）。 */
+const CASES = [
+  { name: '故选 ABD（串首一个字母指代 → 整串都要换）', s: '故选 ABD。', want: '故选 CAB。' },
+  { name: '答案为 AC', s: '答案为 AC。', want: '答案为 CD。' },
+  { name: '故 AB。（「故」后面是串）', s: '故 AB。', want: '故 CA。' },
+  { name: 'AB 两项（串后面跟「两项」）', s: 'AB 两项正确', want: 'CA 两项正确' },
+  { name: 'ACD 三项', s: 'ACD 三项都选', want: 'CDB 三项都选' },
+  { name: 'A、C 两项（顿号分开，改前就对）', s: 'A、C 两项', want: 'C、D 两项' },
+  { name: '故选 A。（单字母，改前就对）', s: '故选 A。', want: '故选 C。' },
+  { name: 'SARS 与 AB 两项（英文词里的字母不碰，串照换）', s: 'SARS 与 AB 两项', want: 'SARS 与 CA 两项' },
+  { name: 'DTT 中的 A 项（同上，单字母）', s: 'DTT 中的 A 项', want: 'DTT 中的 C 项' },
+  { name: 'ABC 理论（后接术语词，整串不碰）', s: '核心是 ABC 理论——A 是诱发事件，B 是信念，C 是情绪与行为结果',
+    want: '核心是 ABC 理论——A 是诱发事件，B 是信念，C 是情绪与行为结果' },
+  { name: '故选 AB 理论（术语词排除优先于「故选」）', s: '故选 AB 理论', want: '故选 AB 理论' },
+  { name: 'ABC 理论中A是诱发事件（p228 那个形状）', s: 'ABC理论中A是诱发事件、B是个体对事件的信念',
+    want: 'ABC理论中A是诱发事件、B是个体对事件的信念' },
+  /* --- 窗口宽度（修复轮 1）：只有窗口宽度不同才分岔的两条 --- */
+  { name: '窗口·往回看：故选＋8 个空格＋A。（6 字符窗口外 → 按现状不换）',
+    s: '故选        A。', want: '故选        A。' },
+  { name: '窗口·往前看：A＋8 个空格＋两项都对（6 字符窗口外 → 按现状不换）',
+    s: 'A        两项都对', want: 'A        两项都对' },
+];
 
 /* —— eval 真源码 ——
    quiz.js 顶层一律 var / function（文件头写死了这条），非严格模式下函数声明会落到
@@ -67,17 +100,33 @@ if (typeof remapExplain !== 'function' || typeof isOptRef !== 'function') {
   throw new Error('eval 之后没拿到两个函数——抠出来的源码不对');
 }
 
+/* —— 追踪版要用的常量也从真源码里取，探针不许自己另存一份 ——
+   连续串的正则、往回看/往前看的窗口宽度都写在 remapExplain 里；
+   抠不到就抛（不是悄悄退回一个默认值）。 */
+function pick(re, what) {
+  const m = remapExplainSrc.match(re);
+  if (!m) throw new Error(`从 remapExplain 源码里读不到${what}——探针不该另存一份`);
+  return m[1];
+}
+const RUN_RE_SRC = pick(/\bre\s*=\s*(\/.*\/[a-z]*)\s*;/, '连续串的正则');
+const RUN_RE_BODY = RUN_RE_SRC.slice(1, RUN_RE_SRC.lastIndexOf('/'));
+const RUN_RE_FLAGS = RUN_RE_SRC.slice(RUN_RE_SRC.lastIndexOf('/') + 1);
+const BACK_CTX = Number(pick(/Math\.max\(0,\s*i\s*-\s*(\d+)\)/, '往回看的窗口'));
+const FWD_CTX = Number(pick(/i\s*\+\s*n\s*\+\s*(\d+)/, '往前看的窗口'));
+if (!(BACK_CTX > 0) || !(FWD_CTX > 0)) throw new Error('窗口宽度解析成了非正数——抠源码那步不对');
+
 /* —— 追踪版：扫描/判定与 remapExplain 同一套，只多记每个字母串的判定 ——
-   规则用真的 isOptRef（上面 eval 进来的），循环靠下面逐题比对盯着。
-   marks 按「字母串」记，不按字母：串长 1 时与老探针逐字段一致。*/
+   规则用真的 isOptRef，窗口用上面从源码读出来的数字，正则用源码里那个；
+   循环本身靠下面的逐题比对盯着。marks 按「字母串」记，不按字母：
+   串长 1 时与老探针逐字段一致。*/
 function remapExplainTrace(q, s) {
   const marks = [];
   if (!s) return { out: s, marks };
   let out = '', last = 0, m;
-  const re = /[ABCD]{1,4}/g;
+  const re = new RegExp(RUN_RE_BODY, RUN_RE_FLAGS);
   while ((m = re.exec(s))) {
     const i = m.index, run = m[0], n = run.length;
-    const pre = s.slice(Math.max(0, i - 6), i), post = s.slice(i + n, i + n + 6);
+    const pre = s.slice(Math.max(0, i - BACK_CTX), i), post = s.slice(i + n, i + n + FWD_CTX);
     const skip = /[A-Za-z]/.test(s.charAt(i - 1)) || /[A-Za-z]/.test(s.charAt(i + n));
     const isRef = !skip && isOptRef(pre, post, n);
     let newRun = run;
@@ -91,19 +140,27 @@ function remapExplainTrace(q, s) {
   return { out: out + s.slice(last), marks };
 }
 
-/* —— 0. 追踪版与源码版必须逐题一致 —— */
+/* —— 0. 追踪版与源码版必须逐题一致 ——
+   语料 = 1000 题 + 每条合成串。合成串必须一起过：真库上区分不出窗口宽度，
+   只比真库的话「追踪版自己另存一个窗口常量」这条缝永远不会响。 */
 {
   let bad = 0;
-  for (const q of qs) {
-    const a = remapExplain(q, q.explanation);
-    const b = remapExplainTrace(q, q.explanation).out;
-    if (a !== b) { bad++; if (bad <= 3) console.log('   ✗', q.id, JSON.stringify(a.slice(0, 40)), '≠', JSON.stringify(b.slice(0, 40))); }
+  const corpus = qs.map(q => [q, q.explanation]).concat(CASES.map(c => [SYN, c.s]));
+  for (const [q, s] of corpus) {
+    const a = remapExplain(q, s);
+    const b = remapExplainTrace(q, s).out;
+    if (a !== b) { bad++; if (bad <= 3) console.log('   ✗', q.id, JSON.stringify(s.slice(0, 40)), '→', JSON.stringify(a.slice(0, 40)), '≠', JSON.stringify(b.slice(0, 40))); }
   }
-  console.log('被测逻辑来自 %s（isOptRef %dB / remapExplain %dB，源文件 sha256 %s）',
-    path.relative(path.join(__dirname, '..'), QUIZ), isOptRefSrc.length, remapExplainSrc.length,
-    crypto.createHash('sha256').update(QUIZ_SRC).digest('hex').slice(0, 12));
-  console.log('追踪版 vs 源码版：1000 题输出%s（%d 处不符）\n',
-    bad ? '❌ 不一致' : '逐题一致 ✅', bad);
+  const qb = Buffer.byteLength(QUIZ_SRC, 'utf8');
+  console.log('被测逻辑来自 %s（抠出 isOptRef %d 字符 / %d 字节、remapExplain %d 字符 / %d 字节；源文件 %d 字节，sha256 %s）',
+    path.relative(path.join(__dirname, '..'), QUIZ),
+    isOptRefSrc.length, Buffer.byteLength(isOptRefSrc, 'utf8'),
+    remapExplainSrc.length, Buffer.byteLength(remapExplainSrc, 'utf8'),
+    qb, crypto.createHash('sha256').update(QUIZ_SRC, 'utf8').digest('hex').slice(0, 12));
+  console.log('追踪版跟着源码走：连续串 %s、往回看 %d、往前看 %d（都从源码里读的）',
+    RUN_RE_SRC, BACK_CTX, FWD_CTX);
+  console.log('追踪版 vs 源码版：%d 题 + %d 条合成串输出%s（%d 处不符）\n',
+    qs.length, CASES.length, bad ? '❌ 不一致' : '逐题一致 ✅', bad);
   if (bad) process.exitCode = 1;
 }
 
@@ -119,6 +176,7 @@ for (const q of qs) {
   if (out !== q.explanation) changed++;
   for (const mk of marks) {
     if (mk.skip) continue;
+    /* 换了没换，直接看源码版输出在该位置上的那一段，而不是看追踪版的内部量 */
     const want = mk.run.split('').map(c => shownKey(q, c)).join('');
     const got = out.slice(mk.i, mk.i + mk.n);
     if (mk.isRef) {
@@ -162,27 +220,7 @@ console.log('\n【故意不换】的多字母串，共 %d 种 —— 连着的�
 [...runNotRef.entries()].sort((a, b) => b[1].n - a[1].n).forEach(([k, v]) => console.log('  ' + pad(v.n, 5) + '  ' + k + '   (如 ' + v.id + ')'));
 
 /* —— 合成用例：真库里一个多字母指代都没有（全库只有 2 处连着的串，都是 ABC 理论），
-   所以「扩了规则有没有用」在真库上看不出来。这里逐条钉死每条新规则，
-   期望值是写死的字符串（置换 A→C B→A C→D D→B 也是写死的），
-   规则一拆就红——见 task-14-report.md 的突变表。 —— */
-const SYN = { id: SYN_ID, type: 'multi', answer: 'ABD',
-              options: [{ key: 'A', text: '甲' }, { key: 'B', text: '乙' }, { key: 'C', text: '丙' }, { key: 'D', text: '丁' }] };
-const CASES = [
-  { name: '故选 ABD（串首一个字母指代 → 整串都要换）', s: '故选 ABD。', want: '故选 CAB。' },
-  { name: '答案为 AC', s: '答案为 AC。', want: '答案为 CD。' },
-  { name: '故 AB。（「故」后面是串）', s: '故 AB。', want: '故 CA。' },
-  { name: 'AB 两项（串后面跟「两项」）', s: 'AB 两项正确', want: 'CA 两项正确' },
-  { name: 'ACD 三项', s: 'ACD 三项都选', want: 'CDB 三项都选' },
-  { name: 'A、C 两项（顿号分开，改前就对）', s: 'A、C 两项', want: 'C、D 两项' },
-  { name: '故选 A。（单字母，改前就对）', s: '故选 A。', want: '故选 C。' },
-  { name: 'SARS 与 AB 两项（英文词里的字母不碰，串照换）', s: 'SARS 与 AB 两项', want: 'SARS 与 CA 两项' },
-  { name: 'DTT 中的 A 项（同上，单字母）', s: 'DTT 中的 A 项', want: 'DTT 中的 C 项' },
-  { name: 'ABC 理论（后接术语词，整串不碰）', s: '核心是 ABC 理论——A 是诱发事件，B 是信念，C 是情绪与行为结果',
-    want: '核心是 ABC 理论——A 是诱发事件，B 是信念，C 是情绪与行为结果' },
-  { name: '故选 AB 理论（术语词排除优先于「故选」）', s: '故选 AB 理论', want: '故选 AB 理论' },
-  { name: 'ABC 理论中A是诱发事件（p228 那个形状）', s: 'ABC理论中A是诱发事件、B是个体对事件的信念',
-    want: 'ABC理论中A是诱发事件、B是个体对事件的信念' },
-];
+   所以「扩了规则有没有用」在真库上看不出来。这里逐条钉死每条新规则与窗口宽度。 —— */
 console.log('\n【合成用例】多字母指代（置换 A→C B→A C→D D→B，写死，逐条比字符串）:');
 const permBad = Object.keys(PERM).filter(k => PERM[k] === k);
 if (permBad.length) {
@@ -198,7 +236,7 @@ for (const c of CASES) {
   if (!good) console.log('       期望 %s\n       实际 %s', JSON.stringify(c.want), JSON.stringify(got));
 }
 if (caseBad) {
-  console.log('\n❌ 合成用例 %d 条不符——多字母规则没接上或被误伤', caseBad);
+  console.log('\n❌ 合成用例 %d 条不符——多字母规则/窗口没接上或被误伤', caseBad);
   process.exitCode = 1;
 } else {
   console.log('  （%d 条全过）', CASES.length);
