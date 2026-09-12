@@ -727,9 +727,9 @@ async function quizSection() {
                         options: [{ key: 'A', text: '甲' }, { key: 'B', text: '乙' },
                                   { key: 'C', text: '丙' }, { key: 'D', text: '丁' }],
                         answer: MANS,
-                        /* 解析里刻意用单字母的选项指代：remapExplain 的逐字母邻接判断
-                           会把连着的「ABD」整串挡掉（A 右邻是字母、B 左右都是字母），
-                           那是任务 14 要扩的地方，本任务不碰——见 ruling 3。 */
+                        /* 解析刻意用**单字母**指代：这一段钉的是勾选/判分那条线，
+                           「故选 A」顺带把单字母重映射当回归基线；连着的多字母串
+                           （「故选 ABD」）由下面【解析字母 · 连着的多字母串】单开一段盖。 */
                         explanation: '故选 A。' });
     const mqs = [0, 1, 2, 3, 4, 5, 6, 7, 8].map(mkQ);
     const n0 = BANK.questions.length;
@@ -991,6 +991,66 @@ async function quizSection() {
     /* 摘干净了：后面几段装配（模考的抽题按模块配额抽）吃的还得是原来那份题库。 */
     ok(BANK.questions.length === n0 && !BANK.questions.some(q => q.id === mqs[0].id),
        `合成题已从题库里摘掉（还是 ${BANK.questions.length} 题，后面几段装配不受影响）`);
+  }
+
+  /* ---------- 解析字母：连着的多字母串（任务 14） ----------
+     真库 1000 题里**没有**连着的多字母指代：全库只有 2 处连着的串，都是「ABC 理论」
+     （见 tools/remap_probe.js 的【故意不换】多字母串那一节）——恰恰是不能换的那种。
+     所以「故选 ABD」这条道只能在合成题上盖；真库那边能证明的是「改前改后逐题没变」，
+     证据在 tools/remap_probe.js 里（固定种子，改前改后 dump 逐字节 diff 为空）。
+     这段走**真实渲染路径**：把合成题答对，从卡片答案行里读解析，跟「按显示顺序独立
+     算出来的期望串」比——两边一个来自渲染、一个来自 shuffledOpts，互相印证。 */
+  console.log('\n【解析字母 · 连着的多字母串】');
+  {
+    /* 一句里两种形状：串前面有「故选」、串后面跟「三项」。两个分支各自都会被钉到。 */
+    const MEXP = '故选 ABD。ABD 三项都对。';
+    const mkMul = i => ({ id: 'test-ml' + i, n: 9990 - i, module: '教育学', type: 'multi',
+                          stem: '多字母解析题干' + i,
+                          options: [{ key: 'A', text: '甲' }, { key: 'B', text: '乙' },
+                                    { key: 'C', text: '丙' }, { key: 'D', text: '丁' }],
+                          answer: 'ABD', explanation: MEXP });
+    /* 九道：乱序是每题随机洗一次的，只有一道题时恰好洗成原序（1/24）会让下面那条变假绿 */
+    const mulqs = [0, 1, 2, 3, 4, 5, 6, 7, 8].map(mkMul);
+    const n0 = BANK.questions.length;
+    mulqs.forEach(q => BANK.questions.unshift(q));
+    try {
+      const M = await bootQuiz();
+      const byId = M.byId;
+      const fireM = (el, ev) => M.listeners.filter(l => l.el === el && l.t === 'click')
+                                             .forEach(l => l.fn(ev));
+      const allBtn = M.fbtns.find(b => b.getAttribute('data-filter') === 'all');
+      const redraw = () => fireM(allBtn, {});
+      const clickOpt = (id, k) => fireM(byId.qlist, { target: { closest: sel => sel === '.opt'
+        ? { disabled: false, getAttribute: a => (a === 'data-q' ? id : k) } : null } });
+      const clickConfirm = id => fireM(byId.qlist, { target: { closest: sel => sel === '[data-confirm]'
+        ? { getAttribute: a => (a === 'data-confirm' ? id : null) } : null } });
+      for (const q of mulqs) {
+        ['A', 'B', 'D'].forEach(k => clickOpt(q.id, k));
+        await settle(); clickConfirm(q.id); await settle();
+      }
+      redraw();
+      const h = byId.qlist.innerHTML;
+      const cardOf = id => h.split('<div class="qz').slice(1)
+                            .find(c => c.includes('data-card="' + id + '"')) || '';
+      let checked = 0, movedN = 0; const bad = [];
+      for (const q of mulqs) {
+        const exp = (cardOf(q.id).match(/class="ans"><span class="key">[A-D]+<\/span>([\s\S]*?)<\/div>/) || [])[1];
+        if (exp === undefined) { bad.push(`${q.id}: 答案行里没有解析`); continue; }
+        checked++;
+        /* 显示字母从乱序结果独立算一遍，不跟 remapExplain 内部那份比 */
+        const order = M.shuffledOpts(q).map(o => o.key);
+        const d = k => 'ABCD'.charAt(order.indexOf(k));
+        const want = `故选 ${d('A')}${d('B')}${d('D')}。${d('A')}${d('B')}${d('D')} 三项都对。`;
+        if (exp !== want) bad.push(`${q.id}: 解析渲染成「${exp}」，按显示字母该是「${want}」`);
+        if (d('A') !== 'A' || d('B') !== 'B' || d('D') !== 'D') movedN++;
+      }
+      ok(checked === mulqs.length, `${mulqs.length} 道题的解析都渲染出来了（${checked}/${mulqs.length}）`);
+      ok(movedN > 0, `其中 ${movedN} 道的选项确实洗过牌——一个都没有的话下面那条是假绿`);
+      ok(bad.length === 0, bad.length ? bad.slice(0, 3).join('; ')
+        : '「故选 ABD」「ABD 三项」整串跟着乱序重映射，串里每个字母都指对显示项');
+    } finally {
+      mulqs.forEach(q => { const i = BANK.questions.indexOf(q); if (i >= 0) BANK.questions.splice(i, 1); });
+    }
   }
 
   /* ---------- 本机记录不是字符串也不能把页面带崩 ----------

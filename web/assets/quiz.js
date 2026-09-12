@@ -132,8 +132,18 @@ function shownKey(q, key) {
      · 「x 项」「故选 x」「故x。」「答案为 x」「x 正确」
      · 「A、B、D」「A 与 B」这类并列枚举里的字母
    不换的例如「ABC 理论——A 是诱发事件，B 是信念」（那是情绪理论的三个变量）、
-   「（B 档）」（双高计划的档次）；整段英文单词里的字母也一律不碰。 */
-function isOptRef(pre, post) {
+   「（B 档）」（双高计划的档次）；整段英文单词里的字母也一律不碰。
+
+   指代不止单字母，还有**连着的字母串**：「故选 ABD」「AB 两项」「ACD 三项」。
+   串必须整串一起判、整串一起换——只看单个字母的话 B 的前面是 A、后面是 D，
+   两条邻接守卫都不认它，会把串里除头一个之外的全漏掉。
+   所以 remapExplain 的扫描单位是「连续 [ABCD] 串」而不是单个字母；
+   相邻字母守卫也跟着挪到整串的两头（串外紧挨拉丁字母才跳过），
+   单字母（串长 1）的判定与从前逐字节一致。 */
+function isOptRef(pre, post, runLen) {
+  /* 连着字母串后面紧跟术语词的是术语缩写，不是选项：「ABC 理论」（理性情绪疗法
+     的三个变量）、「ABC 模型」。只对多字母串生效——单字母的判定一条都不动。 */
+  if (runLen > 1 && /^\s*(理论|模型|阶段|学说|假说|定律|公式|效应)/.test(post)) return false;
   if (/^\s*项/.test(post)) return true;
   if (/(故选|应选|答案为|答案是|答案|正确项是)\s*$/.test(pre)) return true;
   if (/故\s*$/.test(pre)) return true;
@@ -144,12 +154,14 @@ function isOptRef(pre, post) {
 }
 function remapExplain(q, s) {
   if (!s) return s;
-  var out = '', last = 0, m, re = /[ABCD]/g;
+  var out = '', last = 0, m, re = /[ABCD]{1,4}/g;
   while ((m = re.exec(s))) {
-    var i = m.index, ch = m[0];
-    if (/[A-Za-z]/.test(s.charAt(i - 1)) || /[A-Za-z]/.test(s.charAt(i + 1))) continue;
-    if (!isOptRef(s.slice(Math.max(0, i - 6), i), s.slice(i + 1, i + 7))) continue;
-    out += s.slice(last, i) + shownKey(q, ch); last = i + 1;
+    var i = m.index, run = m[0], n = run.length;
+    if (/[A-Za-z]/.test(s.charAt(i - 1)) || /[A-Za-z]/.test(s.charAt(i + n))) continue;
+    if (!isOptRef(s.slice(Math.max(0, i - 6), i), s.slice(i + n, i + n + 6), n)) continue;
+    var repl = '';
+    for (var j = 0; j < n; j++) repl += shownKey(q, run.charAt(j));
+    out += s.slice(last, i) + repl; last = i + n;
   }
   return out + s.slice(last);
 }
