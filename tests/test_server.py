@@ -4,6 +4,7 @@ import hashlib
 import http.client
 import json
 import os
+import random
 import shutil
 import sqlite3
 import tempfile
@@ -656,6 +657,152 @@ class TestMock(ApiCase):
         self.assertEqual(set(run['result']['wrong']), set(r['wrong']))
         wc = {x['id']: x['wrong_count'] for x in self.get('/api/wrong')['questions']}
         self.assertEqual(wc[qid], 1, 'GET 重算成绩时又把错次记了一遍')
+
+    def test_练兵版在真库上退化成全单选而不是开不了考(self):
+        """真库今天 1000 题全是单选、0 判断 0 多选。
+
+        勾了「含多选/判断」不该让整场考试开不起来——题库里没有这类题就不掺，
+        卷子还是完整的 120 道。（默认版只抽单选是**显式筛**，不是靠这条：
+        见 TestMockTypes.test_默认仍是120道全单选。）
+        """
+        d = self.post('/api/mock/start', {'withTypes': True})
+        self.assertEqual(len(d['ids']), 120)
+        self.assertEqual({_lookup(self.db, i, 'type') for i in d['ids']}, {'single'})
+
+
+# ---------------------------------------------------------------------------
+# 练兵版：库里**有**判断题与多选题时的那条路
+# ---------------------------------------------------------------------------
+# 每个模块在练兵版里要多少道判断/多选：quota_by_type 的 MK_TYPE_SPLIT 是「每 6
+# 道出 1 道」。夹具的配额参照 server.py 的 MK_PARTS（同 TestMock.QUOTA）。
+def _seed_typed(db_path):
+    """把临时副本改成「有判断题、有多选题」的库——真库今天 0 判断 0 多选。
+
+    每个模块只留「配额 + 2」道单选，再插 6 道判断 6 道多选：
+      · 默认版只要单选，每个模块还富余 2 道；
+      · 练兵版每个模块最多要 quota//6 道判断 + quota//6 道多选（最大的模块配额
+        23 → 各 3 道），6 道绰绰有余；
+      · **不筛题型的话**每个模块的池子里非单选占大头，抽满配额几乎必然掺进来
+        ——「默认版仍是全单选」那条才咬得动（种子在 setUp 里钉死，见那里）。
+    动的只是临时副本；真源 bank.db 只被读、被拍快照（在 ApiCase 里）。
+    """
+    quota = {'公共基础 · 政治与时政': 16, '公共基础 · 法律': 13,
+             '公共基础 · 经济、管理与常识': 11, '公共基础 · 公文写作': 8,
+             '人文历史与科技常识': 6, '唐山工业职业技术大学校情': 3,
+             '唐山本地政策与时政': 3,
+             '教育学': 23, '教育心理学': 17, '教育法律法规': 7,
+             '教师职业理念与职业道德': 6, '职业教育与高等教育': 7}
+    conn = sqlite3.connect(db_path)
+    try:
+        next_n = (conn.execute('SELECT MAX(n) FROM questions').fetchone()[0] or 0) + 1
+        for mod, q in quota.items():
+            # 只留 quota+2 道单选；其余删掉（临时副本上 attempts/wrong 还是空的，
+            # 不存在外键引用）。
+            keep = [r[0] for r in conn.execute(
+                "SELECT id FROM questions WHERE module=? AND type='single' LIMIT ?",
+                (mod, q + 2))]
+            placeholders = ','.join('?' for _ in keep)
+            conn.execute(f"DELETE FROM questions WHERE module=? AND type='single' "
+                         f"AND id NOT IN ({placeholders})", [mod] + keep)
+            for i in range(6):
+                for typ, opts, ans in (
+                        ('judge', [{'key': 'A', 'text': '正确'}, {'key': 'B', 'text': '错误'}], 'A'),
+                        ('multi', [{'key': k, 'text': '选项' + k} for k in 'ABCD'], 'ABD')):
+                    conn.execute(
+                        'INSERT INTO questions (id,n,section,module,type,stem,options,'
+                        'answer,explanation,batch) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                        (f'zz-{typ}-{next_n}', next_n, 'edu', mod, typ,
+                         f'{typ} 夹具题 {next_n}', json.dumps(opts, ensure_ascii=False),
+                         ans, f'{typ} 夹具题 {next_n} 的解析', 2))
+                    next_n += 1
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestMockTypes(ApiCase):
+    """练兵版开关：默认版仍是一张全单选的 120 题卷子，勾上之后掺判断与多选。
+
+    跑在**种子临时库**上（_seed_typed 插了判断题与多选题）。真库今天 0 判断
+    0 多选，简报那三条对真库跑是恒红的——断言的是「掺进来了」，真库上不可能成立。
+    """
+
+    @classmethod
+    def prepare_db(cls, db_path):
+        _seed_typed(db_path)
+
+    def setUp(self):
+        # 钉死种子：抽题要打乱，「不筛题型就一定会掺进非单选」是概率不是保证，
+        # 固定种子让那条红可复现。只钉在这个类里，别的测试不受影响。
+        random.seed(20260913)
+
+    def type_of(self, qid):
+        """这道题在库里是什么题型。**测试自己查库**，不拿服务端返回的类型当依据
+        ——默认版那条要防的恰恰是「服务端根本没按题型筛」。"""
+        return _lookup(self.db, qid, 'type')
+
+    def test_夹具里确实有判断题与多选题(self):
+        """夹具自查：夹具是空转的，下面两条就都是假绿。"""
+        n_judge = self.count_in_db("SELECT COUNT(*) FROM questions WHERE type='judge'")
+        n_multi = self.count_in_db("SELECT COUNT(*) FROM questions WHERE type='multi'")
+        self.assertGreater(n_judge, 0, '夹具没插进判断题')
+        self.assertGreater(n_multi, 0, '夹具没插进多选题')
+
+    def test_默认仍是120道全单选(self):
+        d = self.post('/api/mock/start', {})
+        self.assertEqual(len(d['ids']), 120)
+        types = {self.type_of(i) for i in d['ids']}
+        self.assertEqual(types, {'single'}, f'默认版混进了别的题型：{sorted(types)}')
+
+    def test_开关打开后掺入判断和多选(self):
+        d = self.post('/api/mock/start', {'withTypes': True})
+        types = {self.type_of(i) for i in d['ids']}
+        self.assertIn('judge', types)
+        self.assertIn('multi', types)
+
+    def test_练兵版与默认版题量相同(self):
+        a = self.post('/api/mock/start', {})
+        b = self.post('/api/mock/start', {'withTypes': True})
+        self.assertEqual(len(a['ids']), len(b['ids']))
+        self.assertEqual(len(b['ids']), 120)
+
+    def test_练兵版每个模块的题量还是配比表那个数(self):
+        """掺题型只换题型，不换配额：每个模块按模块数还是原来那个数。"""
+        d = self.post('/api/mock/start', {'withTypes': True})
+        got = {}
+        for qid in d['ids']:
+            mod = _lookup(self.db, qid, 'module')
+            got[mod] = got.get(mod, 0) + 1
+        self.assertEqual(got, {m: n for m, n in TestMock.QUOTA.items() if m in got})
+        self.assertEqual(sum(got.values()), 120)
+
+    def test_state里记下本场是不是练兵版(self):
+        self.assertIs(self.post('/api/mock/start', {}).get('withTypes'), False)
+        self.assertIs(self.post('/api/mock/start', {'withTypes': True}).get('withTypes'), True)
+
+    def test_练兵版配比表带上各题型题量(self):
+        """GET /api/mock 要同时给两份配比：默认那份与练兵版那份。
+
+        设置面板上的开关一勾就要看到练兵版的题型题量，而配比只此一份——
+        页面自己算一份就是「页面说一套、服务端抽另一套」那条老路。
+        """
+        d = self.get('/api/mock')
+        mods = {}
+        for P in d['partsWithTypes']:
+            for m in P['modules']:
+                mods[m['module']] = m
+        self.assertEqual(set(mods), set(TestMock.QUOTA), '练兵版配比表漏了模块')
+        for mod, q in TestMock.QUOTA.items():
+            m = mods[mod]
+            self.assertEqual(m['judge'] + m['multi'] + m['single'], q,
+                             f'{mod} 的三个题型数加起来不等于配额')
+            self.assertGreaterEqual(m['single'], 1, f'{mod} 的练兵版一道单选都不剩')
+        self.assertGreater(sum(m['judge'] for m in mods.values()), 0, '练兵版一道判断题都没有')
+        self.assertGreater(sum(m['multi'] for m in mods.values()), 0, '练兵版一道多选题都没有')
+        # 默认那份不许带题型数——它只抽单选，带上就是把两版混在一起了。
+        for P in d['parts']:
+            for m in P['modules']:
+                self.assertNotIn('judge', m, '默认配比表带上了题型数')
 
 
 class TestMockShort(ApiCase):

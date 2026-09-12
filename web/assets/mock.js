@@ -25,6 +25,10 @@ var MK_PAGE = 40;                 /* 逐题解析一页显示多少题 */
 /* 服务端说了算的那几样。取回来之前是空的，别在取回来之前渲染。 */
 var mkN = 0, mkSeconds = 0;
 var mkPlan = [];                  /* GET /api/mock 的 parts：配比表 + 成绩单分组 */
+var mkPlanTypes = [];             /* partsWithTypes：练兵版那份（带各题型题量） */
+/* 练兵版开关（含判断/多选）。**只影响下一次开考**：这一场抽完就定了，
+   开关再动也不改手里这张卷子。checkbox 由 mkRenderPlan 建出来，见那里。 */
+var mkWithTypes = false;
 
 var mkBank = null, mkById = {};
 var mkState = null, mkTimer = null, mkShown = MK_PAGE;
@@ -46,6 +50,10 @@ function letterAt(i) { return 'ABCD'.charAt(i); }
    顺序按题缓存在本页面会话里：同一题在本次打开期间顺序固定（答完不会跳）。 */
 var SHUF = {};
 function shuffledOpts(q) {
+  /* 判断题禁止乱序（与 quiz.js 的 shuffledOpts 同一条）：选项从来就是「正确 /
+     错误」两项，乱序只是把这两个换个位置，一点信息都不带，还会让解析里的
+     「选 A」和屏幕对上号变得没必要地难。**返回原数组**，调用方一律只读。 */
+  if (q.type === 'judge') return q.options;
   var idx = SHUF[q.id];
   if (!idx) {
     idx = [];
@@ -72,6 +80,30 @@ function shownKey(q, key) {
   var p = posOf(q, key);
   return p < 0 ? key : letterAt(p);
 }
+/* 一个 key 串在屏幕上长什么样。单选/判断题是单个字母，但**判断题改用选项文字**
+   ——卡上根本没有叫 A 的按钮，写「你选 A」没人看得懂。多选是 'ABD' 这样一串，
+   每一个都要按乱序后的显示位置换一次：直接写 q.answer 的话，选项一乱序，
+   答案行上的字母就和真正标绿的那几个按钮对不上了。
+   （与 quiz.js 的 answerLabel 同一套规则，改的时候两边一起看。） */
+function shownKeys(q, keys) {
+  var s = String(keys == null ? '' : keys);
+  if (q.type === 'judge') {
+    var opts = q.options || [], out = [];
+    for (var i = 0; i < s.length; i++) {
+      var k = s.charAt(i), t = k;
+      for (var j = 0; j < opts.length; j++) { if (opts[j].key === k) t = opts[j].text; }
+      out.push(t);
+    }
+    return out.join('、');
+  }
+  var ls = [];
+  for (var n = 0; n < s.length; n++) ls.push(shownKey(q, s.charAt(n)));
+  return ls.sort().join('');
+}
+/* 某个选项 key 在不在这个作答/答案串里。单选与判断题传进来的是单个字母，多选是
+   'ABD' 这样一串——同一套判断三种题型都成立。（**不能**写成 o.key === q.answer：
+   多选下 'A' === 'ABD' 恒假，四个选项会一个不落地掉进 dim，考生看不出哪几项对。） */
+function mkHas(s, key) { return String(s == null ? '' : s).indexOf(key) >= 0; }
 
 /* ---- 解析里的字母：与刷题引擎同一套规则（见 quiz.js 里那段说明） ---- */
 function isOptRef(pre, post) {
@@ -127,9 +159,13 @@ function mkRenderQ() {
   if (!q) { box.innerHTML = ''; return; }
   var a = mkState.answers[q.id] || null;
   var opts = shuffledOpts(q).map(function (o, i) {
-    var cls = 'opt' + (a === o.key ? ' picked' : '');
+    /* 选中态看「这一项在不在作答串里」——多选的作答是 'AC' 这样一串，
+       写成 a === o.key 的话一项都不会标出来。 */
+    var cls = 'opt' + (mkHas(a, o.key) ? ' picked' : '');
+    /* 判断题不显示 A/B（与刷题页同）：data-mk 照旧挂着，点击靠它认所选项。 */
+    var letter = q.type === 'judge' ? '' : '<span class="k">' + letterAt(i) + '</span>';
     return '<li><button class="' + cls + '" type="button" data-mk="' + o.key + '">'
-      + '<span class="k">' + letterAt(i) + '</span><span class="t">' + o.text + '</span></button></li>';
+      + letter + '<span class="t">' + o.text + '</span></button></li>';
   }).join('');
   var pt = mkPartAt(mkState.i);
   box.innerHTML = '<div class="mk-q">'
@@ -159,19 +195,27 @@ function mkUpdateProg() {
   if (pv) pv.disabled = (mkState.i === 0);
   if (nx) nx.disabled = (mkState.i === mkN - 1);
 }
-/* 设置面板的配比表。数据来自服务端的 parts——**别在这里再写一份配比**，
-   写死的话服务端改了配比、页面还在按老配比预告，考生拿到的是另一张卷子。 */
+/* 设置面板的配比表。数据来自服务端的 parts / partsWithTypes——**别在这里再写
+   一份配比**，写死的话服务端改了配比、页面还在按老配比预告，考生拿到的是另一张卷子。
+
+   练兵版开关也在这里渲染（mock.html 是 考点体系.html 的逐字副本，是生成物，
+   改不得——配比表本来就是这一格填的，开关跟它同源）。开关状态只影响下一次开考。 */
 function mkRenderPlan() {
   var tb = mk$('mkPlan'); if (!tb) return;
-  var rows = '';
-  mkPlan.forEach(function (P, pi) {
+  var rows = '<tr class="withtypes"><td colspan="3"><label>'
+    + '<input type="checkbox" data-mktypes="1"' + (mkWithTypes ? ' checked' : '') + '>'
+    + '含多选/判断（练兵）</label></td></tr>';
+  (mkWithTypes ? mkPlanTypes : mkPlan).forEach(function (P, pi) {
     rows += '<tr class="grp"><td colspan="3">' + mkPartName(pi)
       + '<span class="pn">' + P.n + ' 题 · ' + Math.round(P.n / mkN * 100) + '%</span></td></tr>';
     var g = null;
     (P.modules || []).forEach(function (m) {
       if (m.group !== g && m.group) rows += '<tr class="sub"><td colspan="3">' + m.group + '</td></tr>';
       g = m.group;
-      rows += '<tr><td>' + m.module + '</td><td class="r">' + m.n + '</td><td class="r">'
+      /* 练兵版那份带各题型题量（m.judge 是服务端给的，页面不自己算）。 */
+      var tn = m.judge === undefined ? ''
+        : '<span class="tn">判 ' + m.judge + ' · 多 ' + m.multi + ' · 单 ' + m.single + '</span>';
+      rows += '<tr><td>' + m.module + tn + '</td><td class="r">' + m.n + '</td><td class="r">'
         + Math.round(m.n / mkN * 100) + '%</td></tr>';
     });
   });
@@ -218,7 +262,9 @@ function mkRenderResult(res) {
   el.innerHTML = '<div class="mk-score ' + v + '">'
     + '<p class="verdict">' + word + '</p>'
     + '<p class="big">' + (Math.round(pts * 10) / 10) + '<em>/ 100</em></p>'
-    + '<p class="sub"><span>答对 <b>' + res.right + '</b> / ' + total + ' 题</span>'
+    + '<p class="sub"><span>' + (mkState && mkState.withTypes
+        ? '练兵版 · 含判断/多选' : '标准版 · 全单选') + '</span>'
+    + '<span>答对 <b>' + res.right + '</b> / ' + total + ' 题</span>'
     + '<span>用时 <b>' + mkFmtUsed(res.used || 0) + '</b></span>'
     + '<span>未答 <b>' + (res.unanswered || 0) + '</b> 题</span></p></div>'
     + '<table class="mk-break"><thead><tr><th>模块</th><th class="r">题量</th>'
@@ -255,19 +301,22 @@ function mkRenderRev(reset) {
     var bad = !!(a && wrongSet[id]);
     var cls = !a ? '' : (bad ? 'wrong' : 'right');
     var tag = !a ? '<span class="mk-tag skip">未答</span>'
-      : (bad ? '<span class="mk-tag wrong">错，你选 ' + shownKey(q, a) + '</span>'
+      : (bad ? '<span class="mk-tag wrong">错，你选 ' + shownKeys(q, a) + '</span>'
              : '<span class="mk-tag right">对</span>');
     var opts = shuffledOpts(q).map(function (o, oi) {
       var c = 'opt';
-      if (o.key === q.answer) c += ' correct';
-      else if (o.key === a) c += ' wrong';
+      /* 标绿看「这一项在不在正确答案里」（多选的答案是 'ABD' 这样一串，写成
+         o.key === q.answer 的话一个选项都不会标绿）。少选的人正需要看到自己漏了哪项。 */
+      if (mkHas(q.answer, o.key)) c += ' correct';
+      else if (mkHas(a, o.key)) c += ' wrong';
       else if (a) c += ' dim';
+      var letter = q.type === 'judge' ? '' : '<span class="k">' + letterAt(oi) + '</span>';
       return '<li><button class="' + c + '" type="button" disabled>'
-        + '<span class="k">' + letterAt(oi) + '</span><span class="t">' + o.text + '</span></button></li>';
+        + letter + '<span class="t">' + o.text + '</span></button></li>';
     }).join('');
     html += '<div class="qz ' + cls + '"><p class="stem"><span class="no">' + (i + 1) + '</span>' + q.stem + tag + '</p>'
       + '<ul class="opts">' + opts + '</ul>'
-      + '<div class="ans"><span class="key">' + shownKey(q, q.answer) + '</span>' + remapExplain(q, q.explanation) + '</div></div>';
+      + '<div class="ans"><span class="key">' + shownKeys(q, q.answer) + '</span>' + remapExplain(q, q.explanation) + '</div></div>';
   });
   var left = mkState.ids.length - mkShown;
   if (left > 0) {
@@ -315,16 +364,29 @@ function mkGo(i) {
 }
 
 /* 选了一个选项。**先把这次作答记进服务端**，记上了才算答了——服务端不知道
-   的记录留着只会更乱（判分读的是服务端那份卷子）。记不上就把这次选择撤回。 */
+   的记录留着只会更乱（判分读的是服务端那份卷子）。记不上就把这次选择撤回。
+
+   多选题这里是**切换**不是覆盖：点一下把这一项加进作答串、再点一下拿掉，
+   排好序交上去（与服务端 _norm 的规范序一致）。单选/判断题仍是点一下定一个字母。
+   一次勾选就交一次（模考的作答是实时记在服务端那一场里的，没有「确认作答」那一步）。 */
 async function mkAnswer(key) {
   if (!mkState || mkState.submitted) return;
   var qid = mkState.ids[mkState.i];
-  mkState.answers[qid] = key;
+  var q = mkById[qid];
+  var prev = mkState.answers[qid] || null;
+  var next = key;
+  if (q && q.type === 'multi') {
+    var cur = prev || '';
+    next = mkHas(cur, key)
+      ? cur.split('').filter(function (c) { return c !== key; }).join('')
+      : cur.split('').concat(key).sort().join('');
+  }
+  mkState.answers[qid] = next;
   mkRenderQ(); mkRenderCard(); mkUpdateProg();
   try {
-    await api.post('/api/mock/answer', { qid: qid, chosen: key, i: mkState.i });
+    await api.post('/api/mock/answer', { qid: qid, chosen: next, i: mkState.i });
   } catch (err) {
-    delete mkState.answers[qid];
+    if (prev === null) delete mkState.answers[qid]; else mkState.answers[qid] = prev;
     mkRenderQ(); mkRenderCard(); mkUpdateProg();
     console.error('作答没能记进这场模考：' + err.message);
   }
@@ -335,7 +397,9 @@ async function mkAnswer(key) {
    设置面板上。 */
 async function mkBegin() {
   var run;
-  try { run = await api.post('/api/mock/start', {}); }
+  /* 练兵版开关就在这一次请求里定下：开关只管「下一次开考」，开出去之后
+     这一场是什么版本由服务端记着（成绩单上要标）。 */
+  try { run = await api.post('/api/mock/start', { withTypes: mkWithTypes }); }
   catch (e) {
     var box = mk$('mkSetup');
     if (box) box.insertAdjacentHTML('beforeend',
@@ -416,7 +480,9 @@ async function mockLoad() {
   mkBank = bank.questions || [];
   mkById = {};
   mkBank.forEach(function (q) { mkById[q.id] = q; });
-  mkN = data.n; mkSeconds = data.seconds; mkPlan = data.parts || [];
+  mkN = data.n; mkSeconds = data.seconds;
+  mkPlan = data.parts || [];
+  mkPlanTypes = data.partsWithTypes || [];
   mkRenderPlan();
   await mkRestore(data.run);
 }
@@ -425,6 +491,17 @@ async function mockLoad() {
 (function mkWire() {
   var st = mk$('mkStart');
   if (st) st.addEventListener('click', function () { mkBegin(); });
+
+  /* 练兵版开关。监听器挂在配比表那个 <tbody> 上，不挂在 checkbox 本身——
+     checkbox 是 mkRenderPlan 每次重渲染换掉的，挂在它身上点第二下就没人应了。
+     change 而不是 click：键盘（空格/方向键）改勾选也要跟上。 */
+  var ptb = mk$('mkPlan');
+  if (ptb) ptb.addEventListener('change', function (e) {
+    var c = e.target && e.target.closest ? e.target.closest('[data-mktypes]') : null;
+    if (!c) return;
+    mkWithTypes = !!c.checked;
+    mkRenderPlan();               /* 勾上就换成练兵版那份配比表 */
+  });
 
   var qbox = mk$('mkQ');
   if (qbox) qbox.addEventListener('click', function (e) {

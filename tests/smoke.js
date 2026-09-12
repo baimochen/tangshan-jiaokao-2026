@@ -52,13 +52,25 @@ const PARTS = [
 ];
 const PLAN = PARTS.flatMap(P => P[1]);
 
-/* 服务端 GET /api/mock 会回的那份配比表（形状 = server.py 的 mock_plan()）。 */
-function planPayload(ratio) {
+/* server.py 的 MK_TYPE_SPLIT：练兵版每 6 道配额出 1 道判断、1 道多选，余下单选。 */
+const TYPE_SPLIT = [['judge', 6], ['multi', 6]];
+function typeQuota(n) {
+  const out = {};
+  for (const [typ, per] of TYPE_SPLIT) out[typ] = Math.floor(n / per);
+  out.single = n - out.judge - out.multi;
+  return out;
+}
+/* 服务端 GET /api/mock 会回的那份配比表（形状 = server.py 的 mock_plan()）。
+   withTypes 那份多三个题型题量——页面渲染练兵版配比表用的就是它，页面不自己算。 */
+function planPayload(ratio, withTypes) {
   return ratio.map(([name, mods]) => ({
     name,
     n: mods.reduce((s, m) => s + m[1], 0),
-    modules: mods.map(m => m[2] ? { module: m[0], n: m[1], group: m[2] }
-                                : { module: m[0], n: m[1] }),
+    modules: mods.map(m => {
+      const row = m[2] ? { module: m[0], n: m[1], group: m[2] } : { module: m[0], n: m[1] };
+      if (withTypes) Object.assign(row, typeQuota(m[1]));
+      return row;
+    }),
   }));
 }
 /* 桩扮演服务端抽题（= server.py 的 mock_pick：模块内打乱 → 配额 → 部分内打乱 →
@@ -106,7 +118,8 @@ function gradeRun(run) {
 function useMockPlan(stub, ratio, seconds) {
   stub.mock.ratio = ratio;
   stub.mock.plan = { n: ratio.reduce((s, P) => s + P[1].reduce((t, m) => t + m[1], 0), 0),
-                     seconds: seconds || 7200, parts: planPayload(ratio) };
+                     seconds: seconds || 7200, parts: planPayload(ratio),
+                     partsWithTypes: planPayload(ratio, true) };
 }
 
 /* 装配之间共享这一份 localStorage，每次装配开头清空重灌。 */
@@ -327,6 +340,7 @@ function installFetchStub(opts) {
       const run = stub.mock.run;
       return okJSON({ n: stub.mock.plan.n, seconds: stub.mock.plan.seconds,
                       parts: stub.mock.plan.parts,
+                      partsWithTypes: stub.mock.plan.partsWithTypes,
                       // 已交卷的那场：成绩一并带上（服务端是 GET 时现算的）
                       run: run ? (run.submitted
                         ? Object.assign({}, run, { result: gradeRun(run) }) : run) : null });
@@ -334,7 +348,10 @@ function installFetchStub(opts) {
     if (u.pathname === '/api/mock/start' && method === 'POST') {
       const pick = pickRun(stub.mock.ratio);
       const now = Date.now();
+      let withTypes = false;
+      try { withTypes = JSON.parse(opts2.body).withTypes === true; } catch (e) { withTypes = false; }
       stub.mock.run = { ids: pick.ids, parts: pick.parts, answers: {}, i: 0,
+                        withTypes: withTypes,
                         startedAt: now, endsAt: now + stub.mock.plan.seconds * 1000,
                         submitted: false, submittedAt: 0 };
       return okJSON(Object.assign({}, stub.mock.run));
@@ -478,6 +495,10 @@ async function bootMock(opts) {
 
   /* 取数、以及「关着页面时过期」那条自动交卷都在里面，等它走完再断言。 */
   await mockReady;
+  /* 引擎的内部量挂到表面上（与 bootQuiz 一个路子）：shuffledOpts 是 mock.js 里的
+     函数声明，活在 bootMock 的作用域里，不在 DOM 上。练兵版那段的合成多选要靠它
+     算出「显示顺序」，才能断言答案行的字母确实按乱序换过。 */
+  S.shuffledOpts = shuffledOpts;
   return S;
 }
 
@@ -1585,6 +1606,169 @@ console.log('\n【模考 · 配比照服务端那份渲染】');
 }
 }
 
+/* ---------- 练兵版：含判断/多选的开关 ----------
+   真库里 0 道判断、0 道多选（这是本项目的实情），所以这一段照「错题本」那段的
+   办法造**合成题**插在 BANK 头上：抽题算法（谁被抽中、每个模块配比怎么算）由
+   tests/test_server.py 打真服务验，这里只验页面能做到的——开关、配比表换成
+   partsWithTypes 那份、withTypes 有没有带给服务端、判断题与多选题在题面与
+   成绩单上怎么画。 */
+async function mockTypesSection() {
+  const jq = { id: 'test-mt-j', n: 9901, module: '教育学', section: '教育专业能力测验',
+               type: 'judge', stem: '练兵版合成判断题干', answer: 'A', explanation: '故选 A。',
+               options: [{ key: 'A', text: '正确' }, { key: 'B', text: '错误' }] };
+  const mq = { id: 'test-mt-m', n: 9902, module: '教育学', section: '教育专业能力测验',
+               type: 'multi', stem: '练兵版合成多选题干', answer: 'ABD', explanation: '故选 ABD。',
+               options: [{ key: 'A', text: '甲' }, { key: 'B', text: '乙' },
+                         { key: 'C', text: '丙' }, { key: 'D', text: '丁' }] };
+  const n0 = BANK.questions.length, rnd0 = Math.random;
+  BANK.questions.unshift(jq, mq);
+  bankById[jq.id] = jq; bankById[mq.id] = mq;
+
+  const firesOn = (S, el, ev) => S.listeners.filter(l => l.el === el && l.t === 'click')
+                                           .forEach(l => l.fn(ev));
+  /* 开关挂的是 change（见 mock.js 里那段说明）。 */
+  const fireCh = (S, on) => S.listeners.filter(l => l.el === S.byId.mkPlan && l.t === 'change')
+    .forEach(l => l.fn({ target: { closest: sel =>
+      sel === '[data-mktypes]' ? { checked: on } : null } }));
+  const pick = (S, k) => firesOn(S, S.byId.mkQ, { target: { closest: sel => sel === '[data-mk]'
+    ? { getAttribute: a => (a === 'data-mk' ? k : null) } : null } });
+  /* 成绩单里第 i 张卡（0 是 preamble）。split 是按分隔符切开的，parts[1] 正好
+     只有第一张卡的内容，不会把后面的卡也带进来。 */
+  const card = (html, i) => html.split('<div class="qz ')[i] || '';
+  /* 卡片里每个选项按钮：类名 / 显示字母（判断题为空）/ 选项文字。 */
+  const optsOf = c => [...c.matchAll(
+    /<button class="([^"]*)" type="button" disabled>(?:<span class="k">([A-D])<\/span>)?<span class="t">([^<]*)<\/span>/g)]
+    .map(m => ({ cls: m[1], letter: m[2] || '', text: m[3] }));
+  const texts = (c, word) => optsOf(c).filter(o => o.cls.split(' ').indexOf(word) >= 0)
+    .map(o => o.text).sort().join('、');
+
+  console.log('\n【练兵版 · 开关与配比表】');
+  {
+    const S = await bootMock();
+    const plan = () => S.byId.mkPlan.innerHTML;
+    const starts = () => S.fetch.calls.filter(c => c.path === '/api/mock/start' && c.method === 'POST');
+    ok(/data-mktypes="1"/.test(plan()), '配比表里渲染出「含多选/判断（练兵）」开关');
+    ok(!/checked/.test(plan()), '开关默认不勾（默认还是标准版）');
+    ok(!/class="tn"/.test(plan()), '没勾时配比表不写各题型题量');
+    /* 不勾就开考：withTypes 必须是 false（写死 true 的话这里红）。 */
+    firesOn(S, S.byId.mkStart, {}); await settle();
+    ok(starts().length === 1 && starts()[0].body.withTypes === false,
+       `不勾时开考请求里 withTypes=false（实际 ${JSON.stringify(starts()[0] && starts()[0].body)}）`);
+
+    fireCh(S, true);
+    const p2 = plan();
+    ok(/data-mktypes="1" checked/.test(p2), '勾上之后开关自己也是勾着的');
+    /* 教育学的配额是 23：每 6 道出 1 判 1 多（server.py 的 MK_TYPE_SPLIT），
+       所以是 判 3 · 多 3 · 单 17。**这个数只能来自服务端 partsWithTypes**——
+       页面里没有任何一处 quota 或 //6 的算法。 */
+    const tn = p2.match(/<td>教育学<span class="tn">([^<]*)<\/span>/);
+    ok(!!tn && tn[1] === '判 3 · 多 3 · 单 17',
+       `练兵版配比表带各题型题量、数是服务端那份（教育学那行实际：${tn ? tn[1] : '没写题型题量'}）`);
+    firesOn(S, S.byId.mkStart, {}); await settle();
+    ok(starts().length === 2 && starts()[1].body.withTypes === true,
+       `勾上后开考请求里 withTypes=true（实际 ${JSON.stringify(starts()[1] && starts()[1].body)}）`);
+
+    fireCh(S, false);
+    ok(!/class="tn"/.test(plan()), '取消勾选又换回标准版那份配比表');
+    ok(/data-mktypes="1"(?! checked)/.test(plan()), '取消后开关也不勾了');
+  }
+
+  console.log('\n【练兵版 · 判断题与多选题】');
+  {
+    /* 直接喂一场指定卷子（ids 里只有合成的那两道）：抽题本身不在这里验。 */
+    const now = Date.now();
+    const run = { ids: [jq.id, mq.id], parts: [{ name: '第X部分 · 合成', n: 2 }],
+                  answers: {}, i: 0, withTypes: true,
+                  startedAt: now, endsAt: now + 3600000, submitted: false, submittedAt: 0 };
+    /* 固定乱序，下面「答案行的字母是换过的」才有牙（不乱序时它和原样一样，
+       突变也测不出红）。shuffledOpts 是懒算并缓存的，这时这道多选还没算过。 */
+    Math.random = () => 0;
+    const S = await bootMock({ run });
+    const answers = S.fetch.mock.run.answers;
+    /* 键盘监听由 mock.js 自己在装载时挂上（mockSection 里已有断言钉着它），
+       这里直接用；挂不上时这一节会抛，整轮跑不出 ✅（与断言红同一个后果）。 */
+    const kd = S.docListeners.filter(l => l.t === 'keydown')[0];
+
+    /* ---- 判断题：不打乱、不标字母，点一下就记一个字母 ---- */
+    const jh = S.byId.mkQ.innerHTML;
+    ok(!/<span class="k">/.test(jh), '判断题的按钮上没有 A/B 字母');
+    ok(/<span class="t">正确<\/span>[\s\S]*<span class="t">错误<\/span>/.test(jh),
+       '判断题的选项照原序（正确在前、错误在后），没被打乱');
+    ok(!/picked/.test(jh), '刚进来判断题还没作答');
+    pick(S, 'B'); await settle();
+    ok(answers[jq.id] === 'B',
+       `判断题点一下就记一个字母（实际 ${answers[jq.id] === undefined ? '没记' : answers[jq.id]}）`);
+
+    /* ---- 多选题：点一下是勾选、再点是取消，攒成一串字母 ---- */
+    firesOn(S, S.byId.mkNext, {}); await settle();
+    const mh = () => S.byId.mkQ.innerHTML;
+    const disp = S.shuffledOpts(mq).map(o => o.key);
+    ok(disp.join('') !== 'ABCD', `（前提）这道多选确实被打乱了：显示顺序 ${disp.join('')}`);
+    ok(!/picked/.test(mh()), '多选题刚进来一项都没勾');
+    pick(S, 'A'); await settle();
+    ok(answers[mq.id] === 'A',
+       `多选点一下只勾选（记进这一场的是 ${answers[mq.id] === undefined ? '空' : "'" + answers[mq.id] + "'"}）`);
+    ok(/class="opt picked"[^>]*data-mk="A"/.test(mh()), '勾上的那一项带 picked 标记');
+    pick(S, 'C'); await settle();
+    ok(answers[mq.id] === 'AC',
+       `再勾一项是**累积**成 'AC'，不是顶掉前一个（实际 ${answers[mq.id]}）`);
+    ok((mh().match(/picked/g) || []).length === 2, '两项都标着勾选');
+    pick(S, 'C'); await settle();
+    ok(answers[mq.id] === 'A', `再点一下取消勾选（只加不减的错法在这里红）（实际 ${answers[mq.id]}）`);
+    /* 键盘走的也是累积那条路：按的是显示字母，存进去是原始 key。 */
+    const pos = disp.findIndex(k => k !== 'A');
+    kd.fn({ key: 'ABCD'.charAt(pos) }); await settle();
+    ok(answers[mq.id] === ['A', disp[pos]].sort().join(''),
+       `键盘也能勾多选（按 ${'ABCD'.charAt(pos)} → 原始 key ${disp[pos]}，实际 ${answers[mq.id]}）`);
+    kd.fn({ key: 'ABCD'.charAt(pos) }); await settle();
+    ok(answers[mq.id] === 'A', '键盘再按一下也能取消勾选');
+    pick(S, 'C'); await settle();
+    ok(answers[mq.id] === 'AC', `攒到 'AC'（实际 ${answers[mq.id]}）`);
+
+    /* ---- 交卷：成绩单 ---- */
+    firesOn(S, S.byId.mkSubmitBtn, {}); await settle();
+    /* 逐题解析是点开来才渲染的（成绩单里那一格这时还空着）。 */
+    firesOn(S, S.byId.mkReview, {});
+    const res = S.byId.mkResult.innerHTML;
+    ok(/练兵版 · 含判断\/多选/.test(res), '成绩单上标出这一场是练兵版');
+    ok(!/标准版 · 全单选/.test(res), '练兵版不会同时标成标准版');
+
+    /* 逐题解析渲染进 #mkRev（桩里就是它自己那格，不像真 DOM 能把子节点的
+       innerHTML 带出来——所以卡片要从 mkRev 里取）。 */
+    const rev = S.byId.mkRev.innerHTML;
+    ok(rev.length > 0, '点「查看逐题解析」渲染出解析列表');
+    const jo = card(rev, 1), mo = card(rev, 2);
+    /* 判断题：不标字母，「你选/答案」都写选项文字 */
+    ok(!/<span class="k">/.test(jo), '成绩单上判断题的按钮也没有字母');
+    ok(/错，你选 错误/.test(jo), '判断题的「你选」写的是选项文字「错误」，不是字母');
+    ok(/<span class="key">正确<\/span>/.test(jo), '判断题的答案行写的是「正确」那一项的文字');
+    ok(texts(jo, 'correct') === '正确', `判断题标绿的是「正确」那一项（实际 ${texts(jo, 'correct') || '无'}）`);
+    ok(texts(jo, 'wrong') === '错误', `判断题把选错的「错误」标红（实际 ${texts(jo, 'wrong') || '无'}）`);
+
+    /* 多选题 —— 本任务最要紧的一条：**多选下必须有选项被标绿**。
+       页面上那几个绿是从「这一项在不在答案串里」来的；写成 o.key === q.answer
+       的话 'A' === 'ABD' 恒假，四个选项一个都不会绿（派工单 (C) 表 :262）。 */
+    ok(texts(mo, 'correct') === ['甲', '乙', '丁'].sort().join('、'),
+       `多选的正确项都标了绿（实际 ${texts(mo, 'correct') || '无'}）`);
+    ok(texts(mo, 'wrong') === '丙', `选错的那一项标红（实际 ${texts(mo, 'wrong') || '无'}）`);
+    ok(texts(mo, 'dim') === '', `漏选的项不额外标灰（这道错在选错，不在漏选）（实际 ${texts(mo, 'dim') || '无'}）`);
+    /* 答案行 / 「你选」的字母都要按乱序后的**显示位置**换过，且三个字母都给全。 */
+    const shown = keys => [...keys].map(k => 'ABCD'.charAt(disp.indexOf(k))).sort().join('');
+    const wantAns = shown(mq.answer), wantChosen = shown('AC');
+    ok(wantAns !== 'ABD', `（前提）乱序后答案行的字母不是原样 'ABD'（实际 '${wantAns}'）`);
+    ok((mo.match(/<span class="key">([A-D]+)<\/span>/) || [])[1] === wantAns,
+       `多选答案行给全三个字母、且按显示位置换过（应为 '${wantAns}'，实际 '${(mo.match(/<span class="key">([A-D]+)<\/span>/) || [])[1] || '无'}'）`);
+    ok(new RegExp('错，你选 ' + wantChosen).test(mo),
+       `多选的「你选」也是按显示位置换过的字母串（应为 '${wantChosen}'）`);
+  }
+
+  /* 摘干净：合成题是 unshift 进去的，从**头上**切；乱序也调回原样。 */
+  Math.random = rnd0;
+  BANK.questions.splice(0, 2);
+  ok(BANK.questions.length === n0 && !BANK.questions.some(q => q.id === jq.id || q.id === mq.id),
+     `合成题已从题库里摘掉（还是 ${BANK.questions.length} 题，后面几段装配不受影响）`);
+}
+
 /* ---------- 首页：入口卡片 + 导入旧版记录 ---------- */
 async function homeSection() {
   const A = 'jiaokao-answers-2026', W = 'jiaokao-wrong-2026';
@@ -1911,6 +2095,7 @@ async function wrongSection() {
 (async function () {
   await quizSection();
   await mockSection();
+  await mockTypesSection();
   await homeSection();
   await wrongSection();
   console.log(failed ? `\n❌ ${failed} 项未通过` : '\n✅ 全部通过');

@@ -108,44 +108,100 @@ MK_PARTS = (
     )),
 )
 
+# 练兵版（withTypes）里每个模块的配额怎么分给三种题型：每 6 道里出 1 道判断题、
+# 1 道多选题，余下是单选。用**比例**而不是给 12 个模块各写一行——模块配额从 3 到
+# 23 不等，逐模块写死必然出现「3 道的模块也要 2 道判断」这种怪数，而且配比表一改
+# 就得改两份（配比只有一份这条规矩，见上面）。
+MK_TYPE_SPLIT = (('judge', 6), ('multi', 6))
 
-def mock_plan():
-    """配比表：每部分的题量、每个模块的配额与小组名。
+
+def quota_by_type(n, with_types=False):
+    """一个模块的配额按题型怎么分：`{'judge': …, 'multi': …, 'single': …}`。
+
+    默认版（with_types=False）整块给单选——**这是显式给的 `single`**，不是
+    「库里碰巧没有别的题型」。真库今天确实 1000 题全单选，但那是数据、不是保证：
+    哪天题库里进了判断题，默认那 120 题的 composition 就会自己变，而真库上
+    没有任何现有测试能发现。
+    """
+    want = {}
+    if with_types:
+        for typ, per in MK_TYPE_SPLIT:
+            want[typ] = n // per
+    want['single'] = n - sum(want.values())
+    return want
+
+
+def _plan_row(mod, quota, group, counts=None):
+    """配比表里的一行。counts 是这一行各题型的题量（练兵版才有）。"""
+    row = {'module': mod, 'n': quota}
+    if group:
+        row['group'] = group
+    if counts is not None:
+        row.update(counts)
+    return row
+
+
+def mock_plan(with_types=False):
+    """配比表：每部分的题量、每个模块的配额与小组名；练兵版再带上各题型题量。
 
     每部分的 n 由模块配额求和得出，不另写一份——两处各写一份迟早对不上。
+
+    with_types 时每个模块多三个数：judge / multi / single。这是**目标**配比；
+    实际抽到什么由 mock_pick 说了算（题库里某类题不够时它会退回单选），真数记在
+    那一场的 parts 里（GET /api/mock 的 run.parts）。
     """
     out = []
     for name, mods in MK_PARTS:
         out.append({
             'name': name,
             'n': sum(n for _, n, _ in mods),
-            'modules': [dict([('module', m), ('n', n)] + ([('group', g)] if g else []))
+            'modules': [_plan_row(m, n, g, quota_by_type(n, True) if with_types else None)
                         for m, n, g in mods],
         })
     return out
 
 
-def mock_pick(conn):
+def mock_pick(conn, with_types=False):
     """抽题。与 考点体系.html 的 mkPick() 等价：
 
     每部分先按模块配额凑齐（模块内部打乱），再把这一部分**整体打乱**，最后按
     部分的顺序接起来。所以结果是「公基 60 题打散 + 教基 60 题打散」——两部分
     之间不交错。少了「按部分接起来」这一步，考生就得在公基和教基之间来回跳。
+
+    **题型维度**：默认版只抽 `type='single'`（显式筛，见 quota_by_type）。练兵版
+    （with_types）按 quota_by_type 的配比掺判断题与多选题；某类题不够时**退回
+    单选**——真库今天 0 判断 0 多选，勾一个「含多选/判断」不该让整场考试开不起来。
+    单选不够则是硬错（那说明题库根本不完整，凑不出这一场）。
     """
     pool = {}
-    for qid, mod in conn.execute('SELECT id, module FROM questions'):
-        pool.setdefault(mod, []).append(qid)
+    for qid, mod, typ in conn.execute('SELECT id, module, type FROM questions'):
+        pool.setdefault(mod, {}).setdefault(typ, []).append(qid)
     ids, parts = [], []
     for name, mods in MK_PARTS:
-        out = []
-        for mod, quota, _g in mods:
-            have = list(pool.get(mod, []))       # 副本：打乱的是副本，不动 pool
+        out, rows = [], []
+        for mod, quota, group in mods:
+            by_mod = pool.get(mod, {})
+            want = quota_by_type(quota, with_types)
+            taken = {}
+            for typ in ('judge', 'multi'):
+                need = want.get(typ, 0)
+                if not need:
+                    continue
+                have = list(by_mod.get(typ, []))     # 副本：打乱的是副本，不动 pool
+                random.shuffle(have)
+                taken[typ] = have[:need]             # 不够就有多少拿多少（见 docstring）
+            n_single = quota - sum(len(v) for v in taken.values())
+            have = list(by_mod.get('single', []))
             random.shuffle(have)
-            if len(have) < quota:
-                raise Insufficient(f'题库不足: {mod} 需要 {quota} 只有 {len(have)}')
-            out.extend(have[:quota])
+            if len(have) < n_single:
+                raise Insufficient(f'题库不足: {mod} 需要 {n_single} 只有 {len(have)}')
+            taken['single'] = have[:n_single]
+            for lst in taken.values():
+                out.extend(lst)
+            counts = {typ: len(taken.get(typ, [])) for typ in ('judge', 'multi', 'single')}
+            rows.append(_plan_row(mod, quota, group, counts if with_types else None))
         random.shuffle(out)
-        parts.append({'name': name, 'n': len(out)})
+        parts.append({'name': name, 'n': len(out), 'modules': rows})
         ids.extend(out)
     return ids, parts
 
@@ -354,8 +410,12 @@ def make_handler(db_path, web_dir=WEB):
                                     conn, state, state.get('submittedAt'))
                             except MissingQuestion as e:
                                 return self._send({'error': str(e)}, 404)
+                    # 两份配比一起给：设置面板上的开关一勾就要立刻看到练兵版的
+                    # 题型题量。让客户端自己算一份不可能的——配比只此一份，
+                    # 页面再写一份就是「页面说一套、服务端抽另一套」那条老路。
                     return self._send({'n': MK_N, 'seconds': MK_SECONDS,
-                                       'parts': mock_plan(), 'run': run})
+                                       'parts': mock_plan(),
+                                       'partsWithTypes': mock_plan(True), 'run': run})
                 finally:
                     conn.close()
 
@@ -365,15 +425,28 @@ def make_handler(db_path, web_dir=WEB):
             u = urllib.parse.urlparse(self.path)
 
             if u.path == '/api/mock/start':
+                try:
+                    b = self._body()
+                except BadRequest as e:
+                    return self._send({'error': str(e)}, 400)
+                if not isinstance(b, dict):
+                    return self._send({'error': '请求体要是一个对象'}, 400)
+                # withTypes：练兵版开关。**缺省就是不掺**（老客户端不带这个键、
+                # 手滑传了字符串，都按默认版走）——默认版是显式只抽单选，
+                # 所以「没带这个键」与「带了 False」是同一张卷子。
+                with_types = b.get('withTypes') is True
                 conn = self._conn()
                 try:
                     try:
-                        ids, parts = mock_pick(conn)
+                        ids, parts = mock_pick(conn, with_types)
                     except Insufficient as e:
                         return self._send({'error': str(e)}, 400)
                     # 起止时间存毫秒：客户端要比 Date.now()，ISO 串还得再解一遍。
                     now = int(time.time() * 1000)
+                    # withTypes 记进这一场：成绩单上要标明本场是哪种版本，
+                    # 而「这场是什么版本」只有开考那一刻知道。
                     state = {'ids': ids, 'parts': parts, 'answers': {}, 'i': 0,
+                             'withTypes': with_types,
                              'startedAt': now, 'endsAt': now + MK_SECONDS * 1000,
                              'submitted': False, 'submittedAt': 0}
                     conn.execute(
