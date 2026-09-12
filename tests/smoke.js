@@ -329,6 +329,9 @@ function installFetchStub(opts) {
       for (const qid of Object.keys(b.wrong || {})) {
         if (!known.has(qid)) { skipped.add(qid); continue; }
         if (qid in (b.answers || {})) continue;   // answers 那一步已经处理过
+        /* 「服务器已经知道这道题 → 整道跳过」在 wrong-only 这条路径上也成立：
+           attempts 里有它（比如服务器上答对了）就不许再补一条错题。 */
+        if (tried.has(qid)) { existing.add(qid); continue; }
         if (wrongCount.has(qid)) { existing.add(qid); continue; }
         wrongCount.set(qid, 1);
         imported++;

@@ -94,8 +94,17 @@ def _put_legacy_wrong(conn, qid, chosen, now):
 def import_legacy(conn, answers, wrong):
     """把旧页面 localStorage 里的记录并进 attempts / wrong。
 
-    返回 **(imported, skipped, existing)**：写进去几条、几条用不上（题号对不上
-    现在的题库，或记录不是选中的选项 key）、几条服务器上已经有了。
+    返回 **(imported, skipped, existing)**。三个数**互斥**——每个题号只落进一个
+    桶，判据是「这次导入为它写了至少一行吗」：
+
+      · imported —— 写了：新的 attempts 行，或新的错题行；
+      · existing —— 一行都没写（服务器已经知道这一题：有作答行，或者错题本里已经有）；
+      · skipped  —— 用不上：题号不在这一代题库里，或者记录不是选中的选项 key。
+
+    互斥这条是有意的，所以「服务器上只有一条错题行、没有作答行」的题号，导入给它
+    补上作答行时算 imported——确实写进去了东西，报 existing 会让人以为白点了一下。
+    反过来「服务器上答过这一题」的题号一律 existing，一个字都不动。三数之和因此
+    小于等于请求里的题号总数（重复题号去重后相等）。
 
     老数据的两张表各存各的：answers[qid] 是选中的选项 key（'A' / 'ABD'），
     w[qid] 一律是 1（**旧代码写死的就是 1**）。所以导进来的 wrong_count 一律是 1
@@ -113,6 +122,8 @@ def import_legacy(conn, answers, wrong):
     被盖成导入那一刻（旧 localStorage 里压根没有时间戳，新写的行只能盖导入
     时间），让老记录排到最新。所以：**服务器已经知道这道题，就整个跳过它**，
     连它那条错题也不再补。wrong 那边同理，已有的行连 last_at 都不动。
+    **这一条在两条路径上都成立**：answers 那条由 rowcount 回答，只出现在 wrong 里
+    的题号另外查一遍 attempts——少了这一查，「服务器上答对了」的题会被补出一条错题。
 
     幂等：同一份数据重导一遍不会多出行、也不会把错次累加成 2。这不是多余的
     讲究——重导会真的发生（用户点重试、或在别的标签页又点了一次）。
@@ -149,7 +160,18 @@ def import_legacy(conn, answers, wrong):
             # 已有的那行原样留着。不为「旧数据说它错」再补一行——对错由服务端
             # 那份答案说了算。
             continue
-        # 只记了错、没记作答的题号。同样由 INSERT 自己回答「错题本里有没有」。
+        # 只记了错、没记作答的题号。
+        #
+        # 「服务器已经知道这道题 → 整道跳过」**在两条路径上都得成立**，所以这里
+        # 必须也问一遍 attempts：只看错题本会漏掉「服务器上把这一题**答对了**」的
+        # 那种——它没有错题行，于是旧记录会给它补出一条错题，而那正是「只补不盖」
+        # 要避免的症状（用户其实做对了，错题本里却冒出一道）。判错的题这里问不出
+        # 差别（record_attempt 已经写了错题行，下面那条 INSERT 自然会冲突），所以
+        # 这一问的净效果恰好只有「答对」这一种情形。
+        if conn.execute('SELECT 1 FROM attempts WHERE qid=?', (qid,)).fetchone():
+            existing.add(qid)         # 服务器上答过这一题，一个字都不动
+            continue
+        # 错题本里有没有，仍由 INSERT 自己回答。
         if not _put_legacy_wrong(conn, qid, None, now):
             existing.add(qid)         # 已经有了，连 last_at 都不动
             continue

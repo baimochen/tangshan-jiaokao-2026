@@ -928,6 +928,34 @@ class TestMigrate(ApiCase):
         self.assertEqual(self._row('SELECT at FROM attempts WHERE qid=?', q), (old,),
                          '已有的作答时间被导入那一刻盖掉了')
 
+    def test_服务器答对的题不许旧记录再补一条错题(self):
+        """「服务器已经知道这道题 → 整道跳过」在 wrong-only 那条路径上也得成立。
+        老数据是 wrong ⊆ answers，可这个端点**明确支持**超集形状（[wrong] 单给），
+        而只看错题本的写法会漏掉「服务器上答对了」这种：它没有错题行，于是旧记录
+        给它补出一条——错题本里冒出一道用户其实已经做对的题。"""
+        q, ans, _bad = self._pick(0)
+        self.post('/api/attempts', {'qid': q, 'chosen': ans})     # 服务器上答对
+        self.assertEqual(self.get('/api/wrong')['total'], 0)
+
+        d = self.post('/api/migrate/legacy', {'wrong': {q: 1}})
+        self.assertEqual(d, {'imported': 0, 'skipped': 0, 'existing': 1})
+        self.assertIsNone(self._wrong(q), '服务器说答对，旧记录却给它补了一条错题')
+        self.assertEqual(self.get('/api/wrong')['total'], 0)
+        self.assertEqual(self._attempt(q), (ans, 1), '已有的作答行也被动了')
+
+    def test_已有错题行没有作答行的按导入算(self):
+        """三个数互斥，判据是「这次导入为它写了至少一行吗」。服务器上只有错题行
+        （迁移自己造得出来这种）、没有作答行时，导入补上了作答行——确实写进去了
+        东西，所以算 imported，不算 existing。"""
+        q, _ans, bad = self._pick(0)
+        self._exec('INSERT INTO wrong (qid,chosen,wrong_count,first_at,last_at,resolved) '
+                   'VALUES (?,?,1,?,?,0)', (q, bad, '2019-05-05T00:00:00+08:00',
+                                           '2019-05-05T00:00:00+08:00'))
+        d = self.post('/api/migrate/legacy', {'answers': {q: bad}})
+        self.assertEqual(d, {'imported': 1, 'skipped': 0, 'existing': 0})
+        self.assertEqual(self._attempt(q), (bad, 0), '作答行没写进去')
+        self.assertEqual(self._wrong(q), (bad, 1, 0), '已有的错题行被改了')
+
     def test_已有的错题行不被旧记录改写(self):
         """错题本已有的行连 last_at 都不动：resolved=1 是「已经重做对了」，
         旧记录没有理由把它翻回「还没掌握」，错次也不能被压成 1。"""
