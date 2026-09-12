@@ -142,6 +142,34 @@
     });
   }
 
+  // 上一类 / 下一类。原先由源页面末尾的**第二段**内联脚本生成：它 querySelectorAll
+  // '.nav-list a'，按 href 过滤出 .view 元素，再给**每个** view 末尾挂一条
+  // div.view-nav。拆页之后每页只剩一个 view、而 .nav-list 是本文件注入的，那段
+  // 脚本再也建不出东西——app.css 里 .view-nav 的样式还留着，内容却无声消失了，
+  // 所以照着它的行为搬到这里重建（markup 与原文一致：pv / nx 两个 class）。
+  //
+  // 导航表只有 window.NAV 一份，不在这里再写一遍；当前位置取 body[data-page]，
+  // 和上面高亮用的是同一个值。找不到当前项就整条不挂——宁可没有，也别猜错位置
+  // 把人送到别的分类去。
+  function mountViewNav() {
+    const here = document.body.dataset.page || '';
+    const i = window.NAV.findIndex(function (n) { return n.id === here; });
+    if (i < 0) return;
+    const prev = window.NAV[i - 1];
+    const next = window.NAV[i + 1];
+    const bar = document.createElement('div');
+    bar.className = 'view-nav';
+    bar.innerHTML =
+      (prev ? '<a class="pv" href="' + prev.href + '">← 上一类 · ' + prev.label + '</a>' : '') +
+      (next ? '<a class="nx" href="' + next.href + '">下一类 · ' + next.label + ' →</a>' : '');
+    // 本页那个 .view section 的 id 就是 body[data-page]（由 tests/test_split.py 的
+    // test_section_id_matches_page 钉住）。挂在它后面、footer 前面——源页面里这条
+    // 也是排在正文之后、footer 之前。
+    const view = document.getElementById(here);
+    if (!view || !view.parentNode) return;
+    view.parentNode.insertBefore(bar, view.nextSibling);
+  }
+
   // mountNav 碰 document.body，所以必须等 <body> 存在再跑。
   // 把 <script> 放进 <head>（这是最容易犯的错，而下一步要拿一个模板批量生成
   // 15 个页面——错一次就复制 15 份）时，此刻 document.body 还是 null，
@@ -149,10 +177,12 @@
   // 不如让这个失败模式压根不存在。
   function mount() {
     mountNav();
+    mountViewNav();
     mountTheme();
   }
 
   window.mountNav = mountNav;
+  window.mountViewNav = mountViewNav;
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', mount, { once: true });

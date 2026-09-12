@@ -20,6 +20,11 @@ SECTION_RE = re.compile(
     r'<section class="view" id="([\w-]+)"[^>]*>([\s\S]*?)</section>')
 DATA_PAGE_RE = re.compile(r'<body data-page="([\w-]+)">')
 BODY_TAG_RE = re.compile(r'<body[^>]*>')
+# section 的开标签：**故意宽容**，好把「多带了属性」这种错也抓出来。
+# 用 [^>]* 而不是写死精确串，否则多一个 hidden 就匹配不上、直接静默跳过
+# （这正是修掉的那个假绿：页面 section 上多一个 hidden → 整页空白 → 26 条全绿）。
+SECTION_OPEN_RE = re.compile(r'<section\b[^>]*>')
+FOOTER_RE = re.compile(r'<footer>[\s\S]*?</footer>')
 # head 里的主题脚本：内容不逐字比对（注释可改），只认它做了这件事——
 # 在 app.css 之前、从 localStorage 里取 jiaokao-theme 落到 dataset.theme。
 THEME_RE = re.compile(
@@ -43,6 +48,13 @@ ALL_IDS = CONTENT_IDS + SHELL_IDS
 # 源文件里每一处 `href="#X"` 都指向这 3 个 id，且都在 direction 的 .quick 里。
 ANCHOR_REWRITES = {'quiz': 'quiz.html', 'sprint': 'sprint.html',
                    'mnemonic': 'mnemonic.html'}
+
+# nav.js 里 NAV 的顺序。**它决定「上一类/下一类」指向谁**，所以从 nav.js 里
+# 解析出来逐项比：wrong 排在 quiz 与 mock 之间（源页面的导航里没有错题本，
+# 这一项是拆页后新加的），顺序一变，页面上的前后链接就跟着变。
+NAV_ORDER = ['index', 'direction', 'compare', 'edu', 'pub', 'news', 'local',
+             'school', 'counselor', 'quiz', 'wrong', 'mock', 'mnemonic',
+             'interview', 'sprint', 'material']
 
 
 def read(path):
@@ -82,6 +94,10 @@ class TestPagesExist(unittest.TestCase):
     def test_template_exists(self):
         self.assertTrue(os.path.isfile(os.path.join(WEB, '_template.html')))
 
+    def test_nav_order_covers_every_page(self):
+        """NAV_ORDER 得正好是这 16 页——少一项，那一页就取不到上一类/下一类。"""
+        self.assertEqual(sorted(NAV_ORDER), sorted(ALL_IDS))
+
     def test_every_page_is_complete_html(self):
         for sid in ALL_IDS:
             with self.subTest(page=sid):
@@ -108,6 +124,21 @@ class TestDataPage(unittest.TestCase):
                 found = page_section(read(page_path(sid)))
                 self.assertIsNotNone(found, f'{sid}.html 里没有 .view section')
                 self.assertEqual(found[0], sid)
+
+    def test_section_open_tag_is_exact(self):
+        """开标签必须一个多余属性都没有。
+
+        来源是评审抓到的一个假绿：正文比对用的正则是 `<section class="view"
+        id="X"[^>]*>`——`[^>]*` 把属性放行了，所以往页面 section 上一注入
+        ` hidden`，整页空白，26 条断言照样全绿。这里把开标签写死成精确串。
+        """
+        for sid in ALL_IDS:
+            with self.subTest(page=sid):
+                tags = SECTION_OPEN_RE.findall(read(page_path(sid)))
+                self.assertEqual(
+                    tags, [f'<section class="view" id="{sid}">'],
+                    f'{sid}.html 的 section 开标签不是精确的那一个——'
+                    f'多一个属性（比如 hidden）就会让整页空白却验不出来')
 
 
 class TestVerbatimContent(unittest.TestCase):
@@ -266,6 +297,85 @@ class TestEntryPoints(unittest.TestCase):
                 body = read(page_path(sid)).split('</main>', 1)[1]
                 got = re.findall(r'<script src="([^"]+)"></script>', body)
                 self.assertEqual(got, ['assets/nav.js'] + want.get(sid, []))
+
+
+class TestFooter(unittest.TestCase):
+    """源页面 `<footer>` 是 `.wrap` 的最后一个子节点、在所有 section 之后，
+    拆页只抓 `<section class="view">` 内部，于是它整个被漏掉了——app.css 的
+    footer 样式还在，内容没了。这里逐页按字节验它回来了。"""
+
+    def setUp(self):
+        m = FOOTER_RE.search(read(SRC))
+        self.assertIsNotNone(m, '源文件里找不到 <footer>')
+        self.footer = m.group(0)
+
+    def test_source_footer_has_the_disclaimer(self):
+        """内容本身：练习题不是历年真题这句必须在。"""
+        self.assertIn('不是历年真题', self.footer)
+        for key in ('关于权重', '关于方向判定', '关于辅导员部分的依据',
+                    '笔试日期 2026 年 9 月 27 日'):
+            self.assertIn(key, self.footer)
+
+    def test_footer_is_verbatim_on_every_page(self):
+        for sid in ALL_IDS:
+            with self.subTest(page=sid):
+                found = FOOTER_RE.findall(read(page_path(sid)))
+                self.assertEqual(found, [self.footer],
+                                 f'{sid}.html 的 footer 与源文件不一致')
+
+    def test_footer_sits_inside_wrap_after_the_section(self):
+        for sid in ALL_IDS:
+            with self.subTest(page=sid):
+                html = read(page_path(sid))
+                self.assertLess(html.index('<footer>'), html.index('</main>'),
+                                f'{sid}.html 的 footer 掉到 .wrap 外面了')
+                self.assertLess(html.index('</section>'), html.index('<footer>'),
+                                f'{sid}.html 的 footer 排到了正文前面')
+
+    def test_full_page_is_well_ordered(self):
+        """一遍把顺序钉住：masthead → section → footer → 脚本。"""
+        for sid in ALL_IDS:
+            with self.subTest(page=sid):
+                html = read(page_path(sid))
+                order = [html.index('<header class="masthead">'),
+                         html.index('<section class="view"'),
+                         html.index('<footer>'),
+                         html.index('</main>'),
+                         html.index('<script src="assets/nav.js">')]
+                self.assertEqual(order, sorted(order), f'{sid}.html 五大块顺序不对')
+
+
+class TestViewNavSource(unittest.TestCase):
+    """上一类/下一类由 nav.js 在运行时挂（源页面里是第二段内联脚本干的），
+    所以页面文件里没有它的标记：test_split.py 只能钉住 nav.js **源码**里的
+    约定，真正「渲染得出来」由 `node tests/check_dom.js` 用 DOM 桩验。
+    """
+
+    def setUp(self):
+        self.nav = read(os.path.join(WEB, 'assets', 'nav.js'))
+
+    def test_view_nav_builder_exists(self):
+        for needle in ("'view-nav'", 'class="pv"', 'class="nx"',
+                       '← 上一类 · ', '下一类 · ', ' →'):
+            self.assertIn(needle, self.nav, f'nav.js 里少了 {needle!r}')
+
+    def test_view_nav_reads_nav_and_data_page(self):
+        self.assertIn('window.NAV.findIndex', self.nav)
+        self.assertIn('document.body.dataset.page', self.nav)
+
+    def test_nav_table_exists_exactly_once(self):
+        """view-nav 不许另抄一份导航表：NAV 里 id 字面量正好 16 个。
+
+        多出 16 个就说明有人复制了一份列表——两份早晚会漂移，
+        而漂移的后果是「下一类」把人送到错的分类。
+        """
+        ids = re.findall(r'"id":\s*"([\w-]+)"', self.nav)
+        self.assertEqual(ids, NAV_ORDER,
+                         'nav.js 里的 NAV 与页面/导航顺序不符')
+
+    def test_dom_check_exists(self):
+        """渲染那条腿的检查必须存在，不然「源码里有这几个字」就成了唯一证据。"""
+        self.assertTrue(os.path.isfile(os.path.join(BASE, 'tests', 'check_dom.js')))
 
 
 def load_splitter():

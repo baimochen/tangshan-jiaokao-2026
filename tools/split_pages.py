@@ -51,7 +51,9 @@ SCRIPTS = {
 }
 
 # 首页入口卡片由 home.js 读 window.NAV 渲染（导航数据只在 nav.js 里有一份）。
-INDEX_BODY = ('<p class="lead">从导航栏进入各分类。</p>\n'
+# lead 里的「唐山教考 2026」原本是任务书给首页的 <h1> 文字；页面标题现在归 masthead
+# 的 <h1>（总览）管，再留一个 h1 就是两个，所以把这行字折进 lead，别丢了。
+INDEX_BODY = ('<p class="lead">唐山教考 2026 · 从导航栏进入各分类。</p>\n'
               '<div class="quick" id="quick"></div>')
 WRONG_BODY = '<div id="wrongRoot"></div>'
 
