@@ -803,6 +803,14 @@ async function quizSection() {
 }
 
 async function mockSection() {
+/* 先把 bankById 按**活**数组重挂一遍。bankById 是文件顶上照着 题库.json 建的静态表，
+   而页面段里引擎吃的是 BANK.questions——那是个活数组，测试自己会往里插合成题
+   （见「判断题」那段）。两边一旦对不上（合成题没摘干净），bankById[id] 就是
+   undefined，下面取 .module / .answer 会**直接抛**：整段测试带崩，冒烟套件后一半
+   一条断言都不跑，也就看不见本该报的那条红（MT1 实测 18 次里崩 3 次）。
+   重挂一次就只是让断言红，不让异常红。干净运行时挂的每个键值都与原表逐个相同
+   （同一批对象、同一个键），是空操作。 */
+BANK.questions.forEach(q => { bankById[q.id] = q; });
 const M = await bootMock();
 const byId = M.byId, store = M.store, listeners = M.listeners, docListeners = M.docListeners;
 const calls = M.fetch.calls;
