@@ -47,13 +47,18 @@ var verdicts = {};
 
 function pad(n) { return n < 10 ? '0' + n : '' + n; }
 
+/* 作答记录一律当字符串看。localStorage 是用户随手能改的地方，旧版本也可能写进去
+   别的东西（{"e1":true}、["A"]、7）——非字符串按「什么都没勾」处理，页面照常打开。
+   改前那条 `a === q.answer` 对任何类型都只是「不相等」，谁都没机会把整页带崩。 */
+function ansStr(s) { return typeof s === 'string' ? s : ''; }
+
 /* 与 banklib._norm 同一套规范化：去首尾空白、转大写、去重、排序。
    顺序和重复都不该影响对错——服务端就是这么判的（_norm 里 set() + sorted()），
    客户端重开页面后按答案比的那条也必须跟着，否则「多选题答对了、重开页面
    却变成答错」只在字母不是规范序时冒出来。 */
 function normAns(s) {
   var seen = {}, out = [];
-  s = (s || '').replace(/^\s+|\s+$/g, '').toUpperCase();
+  s = ansStr(s).replace(/^\s+|\s+$/g, '').toUpperCase();
   for (var i = 0; i < s.length; i++) {
     var c = s.charAt(i);
     if (!seen[c]) { seen[c] = 1; out.push(c); }
@@ -152,7 +157,7 @@ function remapExplain(q, s) {
 /* 某个选项 key 在不在这个字母串里。单选/判断题传进来的是单个字母，多选是 'ABD'
    这样一串——同一套判断在三种题型上都成立。（不能写成 o.key === q.answer：
    多选下 'A' === 'ABD' 恒为假，四个选项会一个不落地掉进 dim，用户看不出哪几项对。） */
-function hasKey(s, key) { return (s || '').indexOf(key) >= 0; }
+function hasKey(s, key) { return ansStr(s).indexOf(key) >= 0; }
 
 function optionHTML(q, a, o, di) {
   var cls = 'opt';
@@ -258,7 +263,7 @@ async function submitAnswer(q, chosen) {
   catch (err) {
     /* 没记上就当没答：留一份服务端不知道的记录（错题本、统计）只会更乱。 */
     console.error('作答没能记进题库：' + err.message);
-    return;
+    return false;
   }
   answers[q.id] = chosen;         /* 错题自动进错题本：由 isWrong() 判定 */
   verdicts[q.id] = !!res.correct;
@@ -267,6 +272,7 @@ async function submitAnswer(q, chosen) {
   var old = list.querySelector('[data-card="' + q.id + '"]');
   if (old) old.outerHTML = cardHTML(q);
   stats();
+  return true;
 }
 
 if (list) {
@@ -280,10 +286,15 @@ if (list) {
     if (conf) {
       var cid = conf.getAttribute('data-confirm');
       var cq = byId[cid];
-      if (!cq || answers[cid]) return;
+      /* answers[cid]：已经答过的题不再提交（列表里确认按钮已经撤了，这道守卫挡的是
+         直点旧按钮、以及重渲染前的连点）。disabled：同一次点击事件里同步锁住，
+         两次点击之间隔着 await，光靠 answers[cid] 拦不住第二次。 */
+      if (!cq || answers[cid] || conf.disabled) return;
       var sel = (picks[cid] || []).slice().sort().join('');
       if (!sel) return;           /* 一项都没勾：不提交，也不记一笔空作答 */
-      await submitAnswer(cq, sel);
+      conf.disabled = true;
+      /* 没记上（服务端不通）就把按钮放开，让用户还能重试 */
+      if (!(await submitAnswer(cq, sel))) conf.disabled = false;
       return;
     }
     var btn = e.target.closest ? e.target.closest('.opt') : null;

@@ -718,9 +718,9 @@ async function quizSection() {
      共用的 localStorage，所以这段自己从头攒作答。 */
   console.log('\n【多选题 · 勾选后确认】');
   {
-    /* 八道同答案的合成题（答案 ABD、选项 A/B/C/D）。要八道是为了「答案行显示的
+    /* 九道同答案的合成题（答案 ABD、选项 A/B/C/D）。要这么多是为了「答案行显示的
        字母」那条：选项乱序是**每题随机**洗一次的，只有一道题时恰好洗成原序
-       （1/24 的机会）会让那条变成假绿；八道全洗成原序的概率 (1/24)^8，等于不会发生。 */
+       （1/24 的机会）会让那条变成假绿；九道全洗成原序的概率 (1/24)^9，等于不会发生。 */
     const MANS = 'ABD';
     const mkQ = i => ({ id: 'test-m' + i, n: 9990 - i, module: '教育学', type: 'multi',
                         stem: '多选题干' + i,
@@ -731,7 +731,7 @@ async function quizSection() {
                            会把连着的「ABD」整串挡掉（A 右邻是字母、B 左右都是字母），
                            那是任务 14 要扩的地方，本任务不碰——见 ruling 3。 */
                         explanation: '故选 A。' });
-    const mqs = [0, 1, 2, 3, 4, 5, 6, 7].map(mkQ);
+    const mqs = [0, 1, 2, 3, 4, 5, 6, 7, 8].map(mkQ);
     const n0 = BANK.questions.length;
     mqs.forEach(q => BANK.questions.unshift(q));
     try {
@@ -782,6 +782,20 @@ async function quizSection() {
       ok(pickedOf(html(), m0.id).length === 0, '再点一下取消勾选（切换而不是累积）');
       ok(posts().length === p0, '取消勾选也不提交');
 
+      /* ---- 1b. 一项都没勾就点「确认作答」：不提交、不记 ---- */
+      /* 空勾选要是提交出去，chosen 是空串：服务端 banklib.grade 判 false（悄悄给
+         记一笔错），而本机 answers[qid] 那个空串又是 falsy——卡片看上去还是「没
+         答过」。用户点了个没反应的按钮，账上却多了一笔错题。 */
+      const m3 = mqs[3];
+      clickConfirm(m3.id); await settle();
+      ok(posts().length === p0, '一项都没勾就点「确认作答」不提交');
+      ok(!(m3.id in JSON.parse(store['jiaokao-answers-2026'] || '{}')),
+         '也不在本机记一笔空作答（记了会被判错、卡片却还显示成没答过）');
+      redraw();
+      ok(cardOf(html(), m3.id).includes('data-confirm="' + m3.id + '"')
+         && !cardOf(html(), m3.id).includes('class="ans"'),
+         '（前提）这一题仍是未作答的样子，还能继续勾');
+
       /* ---- 2. 点「确认作答」才把勾选的字母交上去 ---- */
       /* 故意按 D、A、B 的顺序点：钉的是「交上去的是勾选的那几个字母」，
          不是字母串的某种拼法——服务端 _norm 本来就排序，拼法在判分上看不出差别
@@ -801,6 +815,51 @@ async function quizSection() {
          `请求体是这道题与勾选的字母串（${m0.id} → ${chosen0}）`);
       ok(JSON.parse(store['jiaokao-answers-2026'] || '{}')[m0.id] === chosen0,
          '确认后本机才记上这一题');
+
+      /* ---- 2b. 连点两下「确认作答」只发一次请求 ---- */
+      /* 两次点击之间隔着一次 await：第一次读 answers 时它还是空的，answers[cid]
+         那道守卫拦不住第二次，submitAnswer 里的 delete picks 又要等到 await 之后
+         才执行。banklib 每收到一次 POST 就给 wrong_count +1（banklib.py 的 upsert），
+         答错时连点两下就把错次刷成 2。按钮必须在**同步**阶段就锁住。 */
+      const m8 = mqs[8];
+      ['A', 'B', 'D'].forEach(k => clickOpt(m8.id, k));
+      await settle(); redraw();
+      const pDbl = posts().length;
+      /* 两次点击打在**同一个按钮对象**上，跟真实 DOM 一样（disabled 是元素上的状态） */
+      const confEl = { disabled: false, getAttribute: a => (a === 'data-confirm' ? m8.id : null) };
+      const hitConf = () => fireM(byId.qlist, { target: { closest: sel => sel === '[data-confirm]' ? confEl : null } });
+      hitConf(); hitConf(); await settle();
+      ok(posts().length === pDbl + 1,
+         `连点两下「确认作答」只发一次请求（${pDbl} → ${posts().length}）`);
+      const dblSent = posts()[posts().length - 1].body;
+      ok(dblSent.chosen.split('').sort().join('') === MANS,
+         `而且发出去的就是勾选的那几项（${dblSent.qid} → ${dblSent.chosen}）`);
+
+      /* ---- 2c. 服务端没记上：本机也不记，按钮放开让人重试 ---- */
+      /* 桩按 banklib 的形状答话：库里没这道题就 404。把那道题从 BANK 里摘掉（引擎
+         自己那份列表是取数时拷出来的，题还在页面上），POST 就会失败。
+         同步锁按钮是为了防连点，锁死不放又成了「点了没反应」——失败必须放开。 */
+      const m4 = mqs[4];
+      ['A', 'B', 'D'].forEach(k => clickOpt(m4.id, k));
+      await settle(); redraw();
+      const i4 = BANK.questions.indexOf(m4);
+      BANK.questions.splice(i4, 1);
+      const pFail = posts().length;
+      const confEl4 = { disabled: false, getAttribute: a => (a === 'data-confirm' ? m4.id : null) };
+      const hit4 = () => fireM(byId.qlist, { target: { closest: sel => sel === '[data-confirm]' ? confEl4 : null } });
+      hit4(); await settle();
+      BANK.questions.splice(i4, 0, m4);
+      ok(posts().length === pFail + 1, `（前提）这一下确实发了请求、服务端也确实没记上（${pFail} → ${posts().length}）`);
+      ok(!(m4.id in JSON.parse(store['jiaokao-answers-2026'] || '{}')),
+         '服务端没记上就不在本机记（不留服务端不知道的记录）');
+      ok(confEl4.disabled === false, '失败后按钮放开了，用户还能重试');
+      redraw();
+      ok(cardOf(html(), m4.id).includes('data-confirm="' + m4.id + '"')
+         && !cardOf(html(), m4.id).includes('class="ans"'), '卡片也还是没作答的样子');
+      /* 服务端恢复之后，同一张卡再点一次就该答上——「放开」不是摆设 */
+      hit4(); await settle(); redraw();
+      ok(JSON.parse(store['jiaokao-answers-2026'] || '{}')[m4.id] === MANS,
+         '服务端好了再点一次就记上了（重试这条路是通的）');
 
       /* ---- 3. 提交后锁定，按响应体渲染对错 ---- */
       redraw();
@@ -857,6 +916,17 @@ async function quizSection() {
       ok(posts().length === p2, '已提交的题再点选项不发请求（卡片锁住了）');
       redraw();
       ok(JSON.parse(store['jiaokao-answers-2026'])[m0.id] === chosen0, '已提交的作答不会被点乱');
+
+      /* ---- 6b. 已经答过的题再点「确认作答」：不重复提交、不改记录 ---- */
+      /* 列表里这张卡的确认按钮已经撤了（上一节刚断言过），但守卫本身也要立得住：
+         卡片重渲染前后、脚本点到旧按钮、别的标签页改过本机记录，都可能让这个点击
+         落到一道已经答过的题上。 */
+      const pDone = posts().length;
+      const storedM0 = JSON.parse(store['jiaokao-answers-2026'])[m0.id];
+      clickConfirm(m0.id); await settle();
+      ok(posts().length === pDone, '已答过的题再点「确认作答」不再发请求');
+      ok(JSON.parse(store['jiaokao-answers-2026'])[m0.id] === storedM0,
+         '已有的作答记录也没被改写');
 
       /* ---- 7. 答案行显示的字母，必须是那几项**显示出来**的字母 ---- */
       /* 其余的合成题也答对，凑够乱序样本 */
@@ -921,6 +991,26 @@ async function quizSection() {
     /* 摘干净了：后面几段装配（模考的抽题按模块配额抽）吃的还得是原来那份题库。 */
     ok(BANK.questions.length === n0 && !BANK.questions.some(q => q.id === mqs[0].id),
        `合成题已从题库里摘掉（还是 ${BANK.questions.length} 题，后面几段装配不受影响）`);
+  }
+
+  /* ---------- 本机记录不是字符串也不能把页面带崩 ----------
+     本机 localStorage 是用户随手能改的地方（改前那段 `a === q.answer` 对什么类型
+     都只是「不相等」），同一条记录也不保证是字符串。渲染路径上每取一次作答都会
+     过一遍规范化与选项比对，值不是字符串时一旦抛异常，丢的不是一张卡，是**整页**：
+     loadBank 的 catch 会把页面换成「题库没取到…」，用户再也点不动。
+     这一段只用真库里的题（e1），不动 BANK。 */
+  console.log('\n【坏记录不炸页面】');
+  {
+    const bads = [['{"e1":true}', '布尔'], ['{"e1":["A"]}', '数组'], ['{"e1":7}', '数字']];
+    for (const [seed, label] of bads) {
+      const B = await bootQuiz({ seedStore: { 'jiaokao-answers-2026': seed } });
+      const h = B.byId.qlist.innerHTML;
+      const cards = (h.match(/data-card="/g) || []).length;
+      ok(cards === 40 && !/题库没取到/.test(h),
+         `记录是${label}时页面照常渲染首屏（${cards} 张卡，${h.length} 字节）`);
+      ok(B.byId.wrongN.textContent == 1,
+         `这条记录按「没答对」算（错题数 ${B.byId.wrongN.textContent}），与改前一致`);
+    }
   }
 
   /* ---------- 判断题 · 禁止乱序（合成题） ----------
