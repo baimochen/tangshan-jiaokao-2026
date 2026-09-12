@@ -288,10 +288,15 @@ class TestEntryPoints(unittest.TestCase):
         self.assertLess(html.index('assets/nav.js'), html.index('assets/home.js'),
                         'nav.js 必须在 home.js 之前：NAV 由 nav.js 提供')
 
+    def test_index_loads_bank_js_before_home_js(self):
+        html = read(page_path('index'))
+        self.assertLess(html.index('assets/bank.js'), html.index('assets/home.js'),
+                        'bank.js 必须在 home.js 之前：home.js 的导入按钮调 window.api')
+
     def test_page_scripts_match_the_plan(self):
-        # quiz 与 mock 都在各自引擎之前多引一个 bank.js：两个引擎取数用的都是它挂的
+        # quiz、mock、index 都在各自页面脚本之前多引一个 bank.js：都用的它挂的
         # window.api。顺序是断言的一部分——调过来引擎一取数就 ReferenceError。
-        want = {'index': ['assets/home.js'],
+        want = {'index': ['assets/bank.js', 'assets/home.js'],
                 'quiz': ['assets/bank.js', 'assets/quiz.js'],
                 'mock': ['assets/bank.js', 'assets/mock.js'],
                 'wrong': ['assets/wrong.js']}

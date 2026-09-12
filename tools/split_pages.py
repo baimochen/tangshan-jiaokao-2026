@@ -116,8 +116,11 @@ def main():
         written.append((sid + '.html', page))
 
     # 首页壳：入口卡片交给 home.js（读 nav.js 的 window.NAV），不在这里写死。
+    # 也引 bank.js：home.js 的「导入旧版记录」是一次写操作，按项目规矩走
+    # window.api（错误处理只有那一处），别再各写一份 fetch。顺序不能反。
     written.append(('index.html',
                     render(tpl, 'index', EXTRA_TITLES['index'], INDEX_BODY,
+                           '<script src="assets/bank.js"></script>\n'
                            '<script src="assets/home.js"></script>\n')))
     # 错题本壳：Task 15 往里填内容，这里先给出容器，否则导航里那一项是死链。
     written.append(('wrong.html',

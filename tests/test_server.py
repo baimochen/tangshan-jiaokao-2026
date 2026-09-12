@@ -780,6 +780,16 @@ class TestMigrate(ApiCase):
         finally:
             conn.close()
 
+    def _exec(self, sql, args=()):
+        """直接改临时副本。只为摆出「服务器上已经有一条旧记录」这种局面——
+        走 API 摆不出「几年前的 at」「resolved 已经翻成 1」这些状态。"""
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(sql, args)
+            conn.commit()
+        finally:
+            conn.close()
+
     def _attempt(self, qid):
         return self._row('SELECT chosen, correct FROM attempts WHERE qid=?', qid)
 
@@ -793,7 +803,7 @@ class TestMigrate(ApiCase):
         q2, a2, _bad2 = self._pick(1)
         d = self.post('/api/migrate/legacy',
                       {'answers': {q1: bad1, q2: a2}, 'wrong': {q1: 1}})
-        self.assertEqual(d, {'imported': 2, 'skipped': 0})
+        self.assertEqual(d, {'imported': 2, 'skipped': 0, 'existing': 0})
 
         # 作答原样落库，correct 由服务端按现在的题库判
         self.assertEqual(self._attempt(q1), (bad1, 0))
@@ -814,7 +824,7 @@ class TestMigrate(ApiCase):
                 answers[qid] = ans
 
         d = self.post('/api/migrate/legacy', {'answers': answers, 'wrong': wrong})
-        self.assertEqual((d['imported'], d['skipped']), (n, 0))
+        self.assertEqual((d['imported'], d['skipped'], d['existing']), (n, 0, 0))
         st = self.get('/api/stats')
         self.assertEqual(st['done'], n)
         self.assertEqual(st['right'], n - len(wrong))
@@ -824,7 +834,7 @@ class TestMigrate(ApiCase):
         """老数据两张表各存各的：只记了错、没记作答的题号不能丢。"""
         q, _ans, _bad = self._pick(0)
         d = self.post('/api/migrate/legacy', {'answers': {}, 'wrong': {q: 1}})
-        self.assertEqual(d, {'imported': 1, 'skipped': 0})
+        self.assertEqual(d, {'imported': 1, 'skipped': 0, 'existing': 0})
         self.assertIsNone(self._attempt(q), '没作答就不该写 attempts 行')
         self.assertEqual(self._wrong(q), (None, 1, 0), '只记了错的那道没进错题本')
 
@@ -836,10 +846,23 @@ class TestMigrate(ApiCase):
             'answers': {q1: bad1, 'zz-上一代题库-1': 'A', 'zz-上一代题库-2': 'B'},
             'wrong': {q2: 1, 'zz-上一代题库-1': 1}})
         # 死的题号在两张表里都出现过，去重后是 2 条——不是 3 条
-        self.assertEqual(d, {'imported': 2, 'skipped': 2})
+        self.assertEqual(d, {'imported': 2, 'skipped': 2, 'existing': 0})
         # 好的一样进库：发现一个坏题号就整批放弃的写法在这里会红
         self.assertEqual(self._attempt(q1), (bad1, 0))
         self.assertEqual(self._wrong(q2), (None, 1, 0))
+
+    def test_作答不是选项key的也跳过(self):
+        """skipped 有**两种**原因：题号不在这一代题库里，和「记录本身不成样子」
+        （值是数字、对象、null…）。界面把两种都写出来了（只写前者的话，记录写成
+        {"e1":1} 的人会去查一个根本不存在的题库换代问题），服务端两种都得算进
+        skipped，而不是把 1 当成选项 key 一路判下去。"""
+        q1, _a1, _b1 = self._pick(0)
+        q2, a2, _b2 = self._pick(1)
+        d = self.post('/api/migrate/legacy',
+                      {'answers': {q1: 1, q2: a2, 'zz-旧': 'A'}})
+        self.assertEqual(d, {'imported': 1, 'skipped': 2, 'existing': 0})
+        self.assertIsNone(self._attempt(q1), '不成样子的作答不该写进 attempts')
+        self.assertEqual(self._attempt(q2), (a2, 1))
 
     def test_全是死题号也回200而不是500(self):
         """一个死题号都没有时最坏：外键错误（IntegrityError）会变成 500，
@@ -847,7 +870,7 @@ class TestMigrate(ApiCase):
         code, payload = self.raw('/api/migrate/legacy', method='POST', body={
             'answers': {'zz-旧-1': 'A'}, 'wrong': {'zz-旧-2': 1}})
         self.assertEqual(code, 200, payload)
-        self.assertEqual(json.loads(payload), {'imported': 0, 'skipped': 2})
+        self.assertEqual(json.loads(payload), {'imported': 0, 'skipped': 2, 'existing': 0})
         self.assertEqual(self.count_in_db('SELECT COUNT(*) FROM attempts'), 0)
         self.assertEqual(self.count_in_db('SELECT COUNT(*) FROM wrong'), 0)
 
@@ -863,22 +886,72 @@ class TestMigrate(ApiCase):
         self.assertEqual(self._wrong(q2), (None, 1, 0))   # 传的是 3
 
     def test_重导一遍不把错次累加(self):
-        """新刷题页写的正是同一对 key，所以首页那个按钮会再出现、重导是常态。"""
+        """重导是常态（用户点重试、或在别的标签页又点了一次），不能多出行、
+        也不能把错次累加。第二次的那条记录必须报「服务器上已经有了」。"""
         q, _ans, bad = self._pick(0)
         body = {'answers': {q: bad}, 'wrong': {q: 1}}
-        self.post('/api/migrate/legacy', body)
-        self.post('/api/migrate/legacy', body)
+        self.assertEqual(self.post('/api/migrate/legacy', body),
+                         {'imported': 1, 'skipped': 0, 'existing': 0})
+        self.assertEqual(self.post('/api/migrate/legacy', body),
+                         {'imported': 0, 'skipped': 0, 'existing': 1},
+                         '重导一遍该报「已经有了」，而不是又导一次')
         self.assertEqual(self._wrong(q), (bad, 1, 0), '重导一次把错次记成了 2')
         self.assertEqual(self.count_in_db('SELECT COUNT(*) FROM attempts'), 1)
+
+    # ---- 只补不盖（评审 finding 1）----
+    def test_服务器已有的作答不被旧记录改写(self):
+        """旧记录可能比服务器上的**更旧**。拿它去 DO UPDATE 会把「答对了」翻成
+        「答错了」、把正确率拉下来、还平白多出一条错题——一份缓存不该有这种权力。"""
+        q, ans, bad = self._pick(0)
+        self.post('/api/attempts', {'qid': q, 'chosen': ans})     # 服务器上先答对
+        self.assertEqual(self.get('/api/stats')['right'], 1)
+
+        self.assertEqual(self.post('/api/migrate/legacy', {'answers': {q: bad}}),
+                         {'imported': 0, 'skipped': 0, 'existing': 1})
+
+        st = self.get('/api/stats')
+        self.assertEqual((st['done'], st['right']), (1, 1), '旧记录把答对改成了答错')
+        self.assertEqual(self._attempt(q), (ans, 1), 'attempts 行被旧记录盖掉了')
+        self.assertIsNone(self._wrong(q), '服务器说答对，旧记录却塞了一条错题进来')
+        self.assertEqual(self.get('/api/wrong')['total'], 0)
+
+    def test_已有的作答at不被导入时间改写(self):
+        """旧 localStorage 里根本没有时间戳，导入写的只能是导入那一刻。服务器上
+        已有的行必须留着自己的 at，否则老记录会排到最新（评审原话：migrated
+        attempts currently sort as newly made）。"""
+        q, ans, _bad = self._pick(0)
+        old = '2019-05-05T00:00:00+08:00'
+        self._exec('INSERT INTO attempts (qid,chosen,correct,at) VALUES (?,?,1,?)',
+                   (q, ans, old))
+        self.assertEqual(self.post('/api/migrate/legacy', {'answers': {q: ans}}),
+                         {'imported': 0, 'skipped': 0, 'existing': 1})
+        self.assertEqual(self._row('SELECT at FROM attempts WHERE qid=?', q), (old,),
+                         '已有的作答时间被导入那一刻盖掉了')
+
+    def test_已有的错题行不被旧记录改写(self):
+        """错题本已有的行连 last_at 都不动：resolved=1 是「已经重做对了」，
+        旧记录没有理由把它翻回「还没掌握」，错次也不能被压成 1。"""
+        q1, _a1, bad1 = self._pick(0)
+        q2, _a2, _bad2 = self._pick(1)
+        old = '2019-05-05T00:00:00+08:00'
+        self._exec('INSERT INTO wrong (qid,chosen,wrong_count,first_at,last_at,resolved) '
+                   'VALUES (?,?,3,?,?,1)', (q1, bad1, old, old))
+
+        d = self.post('/api/migrate/legacy', {'wrong': {q1: 1, q2: 1}})
+        self.assertEqual(d, {'imported': 1, 'skipped': 0, 'existing': 1})
+        self.assertEqual(self._wrong(q1), (bad1, 3, 1), '已有的错题行被旧记录改了')
+        self.assertEqual(self._row('SELECT last_at FROM wrong WHERE qid=?', q1), (old,),
+                         '已有的 last_at 被导入那一刻盖掉了')
+        self.assertEqual(self._wrong(q2), (None, 1, 0), '新的那条没进错题本')
 
     # ---- 坏请求 ----
     def test_坏请求返回400(self):
         for body in ({'answers': '不是对象'}, {'wrong': [1, 2]}, [1, 2], '不是对象'):
             code, payload = self.raw('/api/migrate/legacy', method='POST', body=body)
             self.assertEqual(code, 400, f'{body!r} → {code} {payload!r}')
-        # 两个键都缺 = 没什么可导的，不是写错了：照 200 回 0/0。
+        # 两个键都缺 = 没什么可导的，不是写错了：照 200 回 0/0/0。
         self.assertEqual(self.post('/api/migrate/legacy', {}),
-                         {'imported': 0, 'skipped': 0})
+                         {'imported': 0, 'skipped': 0, 'existing': 0})
 
 
 if __name__ == '__main__':

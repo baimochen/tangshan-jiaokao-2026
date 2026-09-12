@@ -499,11 +499,14 @@ def make_handler(db_path, web_dir=WEB):
                         return self._send({'error': f'{k} 要是 {{qid: 值}} 形状的对象'}, 400)
                 conn = self._conn()
                 try:
-                    # 写库与「题库里没有的题号就跳过」都在 banklib.import_legacy 里：
-                    # 作答/错题两张表的 SQL 只住在 banklib，路由只管 HTTP 这一层。
-                    imported, skipped = banklib.import_legacy(
+                    # 写库、「题库里没有的题号跳过」、「服务器已有的行不覆盖」都在
+                    # banklib.import_legacy 里：作答/错题两张表的 SQL 只住在 banklib，
+                    # 路由只管 HTTP 这一层。existing 单列一个数是给界面看的——
+                    # 「已经在服务器上了」和「对不上题库」都不是丢数据，但要说清楚。
+                    imported, skipped, existing = banklib.import_legacy(
                         conn, b.get('answers') or {}, b.get('wrong') or {})
-                    return self._send({'imported': imported, 'skipped': skipped})
+                    return self._send({'imported': imported, 'skipped': skipped,
+                                       'existing': existing})
                 finally:
                     conn.close()
             return self._send({'error': 'not found'}, 404)

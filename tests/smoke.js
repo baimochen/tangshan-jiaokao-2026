@@ -223,6 +223,7 @@ const norm = s => [...new Set((s || '').trim().toUpperCase())].sort().join('');
 function installFetchStub(opts) {
   opts = opts || {};
   const wrongCount = new Map();   // qid → 累计错次（banklib.record_attempt 的语义）
+  const tried = new Set();        // qid → 已经有过作答行（迁移「只补不盖」的依据）
   const calls = [];               // 每一次请求：{path, method, body}
   const okJSON = obj => ({ ok: true, status: 200, statusText: 'OK', json: async () => obj });
   const errJSON = (status, error) => ({ ok: false, status, statusText: 'error', json: async () => ({ error }) });
@@ -258,6 +259,7 @@ function installFetchStub(opts) {
       // 库里没这道题：服务端是 404 + {'error':…}。桩里照同一个形状回，
       // 引擎才不会把「题不在库里」当成「记上了」。
       if (!item) return errJSON(404, '题库里没有这道题：' + b.qid);
+      tried.add(b.qid);   // 这一题服务器上从此有作答行了，迁移那边要看得见
       if (stub.override && stub.override.qid === b.qid) {
         const o = stub.override;
         return okJSON({ correct: o.correct, answer: o.answer,
@@ -316,17 +318,22 @@ function installFetchStub(opts) {
       if (stub.migrate) return okJSON(stub.migrate);
       const b = JSON.parse(opts2.body);
       const known = new Set(BANK.questions.map(q => q.id));
-      const skipped = new Set();
+      const skipped = new Set(), existing = new Set();
       let imported = 0;
       for (const qid of Object.keys(b.answers || {})) {
-        if (known.has(qid)) imported++; else skipped.add(qid);
+        if (!known.has(qid)) { skipped.add(qid); continue; }
+        if (tried.has(qid)) { existing.add(qid); continue; }   // 服务器已有：只补不盖
+        tried.add(qid);
+        imported++;
       }
       for (const qid of Object.keys(b.wrong || {})) {
         if (!known.has(qid)) { skipped.add(qid); continue; }
         if (qid in (b.answers || {})) continue;   // answers 那一步已经处理过
+        if (wrongCount.has(qid)) { existing.add(qid); continue; }
+        wrongCount.set(qid, 1);
         imported++;
       }
-      return okJSON({ imported, skipped: skipped.size });
+      return okJSON({ imported, skipped: skipped.size, existing: existing.size });
     }
     return errJSON(404, 'not found');
   };
@@ -412,15 +419,15 @@ async function bootMock(opts) {
 
 /* ---------- 装配三：首页（入口卡片 + 导入旧版记录） ----------
    与上面两段同一套路：读页面自己的脚本集、按页面顺序 eval。
-   首页没有 bank.js（tests/test_split.py 把它的脚本集钉死成 nav + home 两个），
-   所以这里还要把前两段装配泄漏到 global 上的 window.api 抹掉——
-   不抹的话跑的是借来的 api 封装，测不到 home.js 自己那条 fetch 退路。 */
-const HOME_WANT_SCRIPTS = ['assets/nav.js', 'assets/home.js'];
+   首页和刷题/模考页一样引 bank.js——home.js 的导入按钮走 window.api，
+   项目里写操作只有那一份 fetch 封装。 */
+const HOME_WANT_SCRIPTS = ['assets/nav.js', 'assets/bank.js', 'assets/home.js'];
 const HOME_PAGE_SCRIPTS = [...INDEX_HTML.split('</main>')[1]
   .matchAll(/<script src="([^"]+)"><\/script>/g)].map(m => m[1]);
 if (HOME_PAGE_SCRIPTS.join('|') !== HOME_WANT_SCRIPTS.join('|')) {
   console.error(`index.html 的脚本集变了：${HOME_PAGE_SCRIPTS.join(' / ')}`
-    + `（首页需要 ${HOME_WANT_SCRIPTS.join(' / ')}——nav.js 提供 NAV，必须在 home.js 之前）`);
+    + `（首页需要 ${HOME_WANT_SCRIPTS.join(' / ')}——nav.js 提供 NAV，`
+    + 'bank.js 提供 window.api，都必须在 home.js 之前）');
   process.exit(1);
 }
 
@@ -429,9 +436,7 @@ async function bootHome(opts) {
   const S = makeStub(INDEX_HTML, [], { idsFromHtml: true, readyState: 'loading',
                                       seedStore: opts.seedStore || null });
   S.fetch = installFetchStub();
-  delete global.api;            // 见上：首页真的没有 bank.js
-  eval(readAsset(HOME_PAGE_SCRIPTS[0]));
-  eval(readAsset(HOME_PAGE_SCRIPTS[1]));
+  HOME_PAGE_SCRIPTS.forEach(rel => eval(readAsset(rel)));
   return S;
 }
 
@@ -1028,6 +1033,7 @@ console.log('\n【模考 · 配比照服务端那份渲染】');
 /* ---------- 首页：入口卡片 + 导入旧版记录 ---------- */
 async function homeSection() {
   const A = 'jiaokao-answers-2026', W = 'jiaokao-wrong-2026';
+  const M = 'jiaokao-migrated-2026';
   /* 按钮由 home.js 建出来塞进 #quick，页面 HTML 里没有它——桩里按 id 找
      （真实 DOM 里就是 getElementById('legacyImport')）。 */
   const btnOf = S => (S.byId.quick.children || []).find(c => c.id === 'legacyImport') || null;
@@ -1051,30 +1057,41 @@ async function homeSection() {
 
   console.log('\n【首页 · 导入旧版记录】');
   {
-    /* 只在两个 key 都在时才建按钮：只有一个就没有可导的东西（老页面永远是
-       两个一起写、一起清）。三条都验，是因为「显示条件写反」有几种写法。 */
+    /* 显示条件是「两个映射里至少一个非空」+「本机还没迁过」。
+       不能拿「key 在不在」当条件：新刷题页/模考页写的正是同一对 key，每个刷过题
+       的新用户都会永远看到这个按钮（C89）。 */
     const none = await bootHome({});
     ok(!btnOf(none), '两个 key 都没有时不建按钮');
     const onlyA = await bootHome({ seedStore: { [A]: '{"e1":"A"}' } });
-    ok(!btnOf(onlyA), '只有作答 key、没有错题 key 时不建按钮');
+    ok(!!btnOf(onlyA), '只有作答 key、但里面有东西时也建按钮');
     const onlyW = await bootHome({ seedStore: { [W]: '{"e1":1}' } });
-    ok(!btnOf(onlyW), '只有错题 key 时不建按钮');
+    ok(!!btnOf(onlyW), '只有错题 key、但里面有东西时也建按钮');
+
+    /* 新页面自己写出来的「没有旧记录」就是这个样子（两个空表，见 quiz.js /
+       mock.js 的 persist）：一个空表都没得导，按钮不该出现。 */
+    const empties = await bootHome({ seedStore: { [A]: '{}', [W]: '{}' } });
+    ok(!btnOf(empties), '两个 key 都在、但两张空表时不建按钮（新页面写的就是这个）');
+
+    /* 迁过一次就不再打扰：标记在，旧记录还在也不建按钮。 */
+    const marked = await bootHome({ seedStore: Object.assign(seedBoth(), { [M]: '1' }) });
+    ok(!btnOf(marked), '本机迁过一次后（标记在）不再建按钮');
 
     /* 存的内容坏了：当没有旧记录，首页剩下的部分照样渲染完（不能整段抛在这儿）。
-       「不是 JSON」和「是 JSON 但不是对象」两种都要挡——只挡前者的话，
-       `"一串字"` 这种能解出来、Object.keys 一取就成了 ['0','1',…]，发出去的东西
-       连服务端都认不出来。 */
+       「不是 JSON」「是 JSON 但不是对象」「是数组」三种都要挡——`typeof []` 也是
+       'object'，少了数组这一条，JSON.parse('[1,2]') 会一路过到 POST 出去。 */
     const broken = await bootHome({ seedStore: { [A]: '不是 json', [W]: '{}' } });
     ok(!btnOf(broken), '旧记录不是 JSON 时不建按钮');
     const notObj = await bootHome({ seedStore: { [A]: '"一串字"', [W]: '{"e1":1}' } });
     ok(!btnOf(notObj), '旧记录解出来不是对象时也不建按钮');
+    const arr = await bootHome({ seedStore: { [A]: '[1,2]', [W]: '{"e1":1}' } });
+    ok(!btnOf(arr), '旧记录解出来是数组时也不建按钮（Array.isArray 那一条）');
     ok(broken.byId.quick.innerHTML.includes('href="quiz.html"'),
        '旧记录坏了，入口卡片照样渲染出来');
 
-    /* 两个 key 都在：按钮上要写明本机有多少条（导之前先让用户知道导什么） */
+    /* 有旧记录：按钮上要写明本机有多少条（导之前先让用户知道导什么） */
     const S = await bootHome({ seedStore: seedBoth() });
     const btn = btnOf(S);
-    ok(!!btn, '两个 key 都在时才建出按钮');
+    ok(!!btn, '有旧记录时建出按钮');
     ok(!!btn && /4 条作答/.test(btn.innerHTML) && /2 条错题/.test(btn.innerHTML),
        `按钮上写明本机存了多少条（${btn ? text(btn) : '—'}）`);
 
@@ -1086,19 +1103,40 @@ async function homeSection() {
        && JSON.stringify(sent[0].body.answers) === JSON.stringify(SEED_A)
        && JSON.stringify(sent[0].body.wrong) === JSON.stringify(SEED_W),
        '请求体是解析开的两个映射，不是 localStorage 里的原始字符串');
-    /* 结果照响应体报：桩按「题库里有没有这个题号」算，两个死题号被跳过 */
-    ok(!!btn && /已导入 3 条/.test(btn.innerHTML) && /跳过 2 条/.test(btn.innerHTML),
+    /* 结果照响应体报：桩按「题库里有没有这个题号」算，两个死题号被跳过。
+       跳过的说明必须把两种原因都写出来（题号不在库里 / 记录不是选中的选项），
+       只写前者的话，记录写成 {"e1":1} 的人会去查一个不存在的题库换代问题。 */
+    ok(!!btn && /已导入 3 条/.test(btn.innerHTML)
+       && /2 条对不上现在的题库/.test(btn.innerHTML)
+       && /记录不是选中的选项/.test(btn.innerHTML),
        `导入结果照响应体报（${btn ? text(btn) : '没有按钮'}）`);
     ok(!!btn && btn.disabled === true, '导完按钮禁用，防连点发两遍');
+    ok(global.localStorage.getItem(M) === '1',
+       `导成功后本机记上迁移标记（标记=${global.localStorage.getItem(M)}）`);
 
-    /* 更强的一条：桩回一个和本机对不上的 7/3，页面若自己数（4 条作答）就对不上 */
+    /* 服务器上已经有的题号：报「已经有了」，不是「跳过」，也不是「已导入」。
+       先让服务器真的有一条 e1 的作答行（走同一个桩的 POST /api/attempts）。 */
+    const S4 = await bootHome({ seedStore: seedBoth() });
+    const e1 = BANK.questions.find(q => q.id === 'e1');
+    await global.fetch('/api/attempts', { method: 'POST',
+      body: JSON.stringify({ qid: 'e1', chosen: e1.answer }) });
+    const b4 = btnOf(S4);
+    if (b4) fires(S4, b4, {});
+    await settle();
+    /* e1 服务器已有 → existing 1；e10、p16 新的 → imported 2；两个死题号 → skipped 2 */
+    ok(!!b4 && /已导入 2 条/.test(b4.innerHTML)
+       && /1 条服务器上已经有了/.test(b4.innerHTML),
+       `服务器已有的题号单算一档（${b4 ? text(b4) : '没有按钮'}）`);
+
+    /* 更强的一条：桩回一个和本机对不上的 7/3/5，页面若自己数（4 条作答）就对不上 */
     const S2 = await bootHome({ seedStore: seedBoth() });
-    S2.fetch.migrate = { imported: 7, skipped: 3 };
+    S2.fetch.migrate = { imported: 7, skipped: 3, existing: 5 };
     const b2 = btnOf(S2);
     if (b2) fires(S2, b2, {});
     await settle();
-    ok(!!b2 && /已导入 7 条/.test(b2.innerHTML) && /跳过 3 条/.test(b2.innerHTML),
-       `结果取的是响应体（桩回 7/3，页面显示 ${b2 ? text(b2) : '没有按钮'}）`);
+    ok(!!b2 && /已导入 7 条/.test(b2.innerHTML) && /3 条对不上/.test(b2.innerHTML)
+       && /5 条服务器上已经有了/.test(b2.innerHTML),
+       `结果取的是响应体（桩回 7/3/5，页面显示 ${b2 ? text(b2) : '没有按钮'}）`);
 
     /* 失败：服务端那句原话要显示出来，而且还能再点 */
     const S3 = await bootHome({ seedStore: seedBoth() });
@@ -1109,6 +1147,9 @@ async function homeSection() {
     ok(!!b3 && b3.disabled === false, '导入失败后按钮恢复可点（能重试）');
     ok(!!b3 && /导入失败：服务端说这次不行/.test(b3.innerHTML),
        `失败原因照服务端那句显示（${b3 ? text(b3) : '没有按钮'}）`);
+    /* 没导成就不该记标记——记了的话这份旧记录以后永远导不进去了。 */
+    ok(global.localStorage.getItem(M) === null,
+       `导入失败不记迁移标记（标记=${global.localStorage.getItem(M)}）`);
   }
 }
 
